@@ -37,10 +37,11 @@ if ((Test-Path (Join-Path $src 'app.rc')) -and (Test-Path $windres)) {
 $gccArgs = @(
     '-std=c17', '-O2', '-Wall', '-Wextra',
     '-municode', '-mwindows',
-    '-finput-charset=UTF-8', '-fexec-charset=UTF-8', '-fwide-exec-charset=UTF-16LE',
-    (Join-Path $src 'main.c'),
-    (Join-Path $src 'image.c')
+    '-finput-charset=UTF-8', '-fexec-charset=UTF-8', '-fwide-exec-charset=UTF-16LE'
 )
+Get-ChildItem -Path $src -Filter '*.c' | Sort-Object Name | ForEach-Object {
+    $gccArgs += $_.FullName
+}
 $res = Join-Path $out 'app_res.o'
 if (Test-Path $res) { $gccArgs += $res }
 $gccArgs += @(

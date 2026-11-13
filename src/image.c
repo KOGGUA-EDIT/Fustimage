@@ -132,11 +132,12 @@ static void apply_orientation_in_place(LumaImage *image, int orientation) {
     image->stride = nw * 4;
 }
 
-bool luma_image_load(const wchar_t *path, LumaImage *out,
+static bool load_any(const wchar_t *path, UINT max_side, LumaImage *out,
                      wchar_t *error, size_t error_cap) {
     IWICImagingFactory *factory = NULL;
     IWICBitmapDecoder *decoder = NULL;
     IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapScaler *scaler = NULL;
     IWICFormatConverter *converter = NULL;
     UINT width = 0;
     UINT height = 0;
@@ -186,17 +187,37 @@ bool luma_image_load(const wchar_t *path, LumaImage *out,
 
     orientation = exif_orientation(frame);
 
-    hr = factory->lpVtbl->CreateFormatConverter(factory, &converter);
-    if (FAILED(hr)) {
-        set_hresult_error(error, error_cap, L"无法准备图像像素", hr);
-        goto fail;
-    }
-    hr = converter->lpVtbl->Initialize(
-        converter, (IWICBitmapSource *)frame, &GUID_WICPixelFormat32bppPBGRA,
-        WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) {
-        set_hresult_error(error, error_cap, L"无法转换图片格式", hr);
-        goto fail;
+    {
+        IWICBitmapSource *source = (IWICBitmapSource *)frame;
+        UINT fw = 0, fh = 0;
+        frame->lpVtbl->GetSize(frame, &fw, &fh);
+        if (max_side > 0 && fw > 0 && fh > 0 &&
+            (fw > max_side || fh > max_side)) {
+            double scale = (double)max_side / (double)(fw > fh ? fw : fh);
+            UINT dw = (UINT)((double)fw * scale + 0.5);
+            UINT dh = (UINT)((double)fh * scale + 0.5);
+            if (dw == 0) dw = 1;
+            if (dh == 0) dh = 1;
+            if (SUCCEEDED(factory->lpVtbl->CreateBitmapScaler(factory,
+                                                             &scaler)) &&
+                SUCCEEDED(scaler->lpVtbl->Initialize(
+                    scaler, (IWICBitmapSource *)frame, dw, dh,
+                    WICBitmapInterpolationModeFant))) {
+                source = (IWICBitmapSource *)scaler;
+            }
+        }
+        hr = factory->lpVtbl->CreateFormatConverter(factory, &converter);
+        if (FAILED(hr)) {
+            set_hresult_error(error, error_cap, L"无法准备图像像素", hr);
+            goto fail;
+        }
+        hr = converter->lpVtbl->Initialize(
+            converter, source, &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) {
+            set_hresult_error(error, error_cap, L"无法转换图片格式", hr);
+            goto fail;
+        }
     }
 
     hr = converter->lpVtbl->GetSize(converter, &width, &height);
@@ -231,6 +252,7 @@ bool luma_image_load(const wchar_t *path, LumaImage *out,
     apply_orientation_in_place(out, orientation);
 
     LUMA_RELEASE(converter);
+    LUMA_RELEASE(scaler);
     LUMA_RELEASE(frame);
     LUMA_RELEASE(decoder);
     LUMA_RELEASE(factory);
@@ -242,6 +264,7 @@ bool luma_image_load(const wchar_t *path, LumaImage *out,
 fail:
     free(pixels);
     LUMA_RELEASE(converter);
+    LUMA_RELEASE(scaler);
     LUMA_RELEASE(frame);
     LUMA_RELEASE(decoder);
     LUMA_RELEASE(factory);
@@ -630,4 +653,46 @@ bool luma_image_export(const LumaImage *image, int rotation, bool mirror_h,
     free(out);
     free(bgra);
     return ok;
+}
+
+/* ---------------------------------------------------------------- public API */
+
+bool luma_image_load(const wchar_t *path, LumaImage *out, wchar_t *error,
+                     size_t error_cap) {
+    return load_any(path, 0, out, error, error_cap);
+}
+
+bool image_load_scaled(const wchar_t *path, UINT max_side, LumaImage *out,
+                       wchar_t *error, size_t error_cap) {
+    return load_any(path, max_side, out, error, error_cap);
+}
+
+/* Filters run on premultiplied BGRA: grey is a weighted sum (linear, so the
+   alpha factor carries through), invert becomes a - c, which keeps edges
+   clean on transparent pixels. */
+void image_apply_filters(LumaImage *image, bool grayscale, bool invert) {
+    UINT x, y;
+    if (image == NULL || image->pixels == NULL) {
+        return;
+    }
+    for (y = 0; y < image->height; ++y) {
+        uint8_t *row = image->pixels + (size_t)y * image->stride;
+        for (x = 0; x < image->width; ++x) {
+            uint8_t *px = row + (size_t)x * 4u;
+            if (grayscale) {
+                unsigned l = (unsigned)(0.2126 * px[2] + 0.7152 * px[1] +
+                                        0.0722 * px[0] + 0.5);
+                if (l > 255u) l = 255u;
+                px[0] = (uint8_t)l;
+                px[1] = (uint8_t)l;
+                px[2] = (uint8_t)l;
+            }
+            if (invert) {
+                unsigned a = px[3];
+                px[0] = (uint8_t)(a - px[0]);
+                px[1] = (uint8_t)(a - px[1]);
+                px[2] = (uint8_t)(a - px[2]);
+            }
+        }
+    }
 }

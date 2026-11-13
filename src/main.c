@@ -1,2645 +1,2157 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#define WIN32_LEAN_AND_MEAN
-#define _WIN32_WINNT 0x0A00
+/* main.c — window, message loop, and the actions behind the interface.
 
-#include <windows.h>
-#include <windowsx.h>
-#include <d2d1.h>
-#include <dwrite.h>
+   Startup order is the whole point of this file.  Measured facts from
+   bench/STARTUP-ANALYSIS.md: creating a *hardware* D3D render target costs
+   250-340 ms on a hybrid-GPU laptop (one-time driver init), while the WARP
+   software target costs 30-55 ms and paints the same pixels.  So:
+
+     1. factories + text formats      (~12 ms; no COM, no D2D device yet)
+     2. hidden window -> ShowWindow   (~25 ms; WM_ERASEBKGND fills the surface
+                                       colour, so the window is never blank)
+     3. CreateHwndRenderTarget (WARP)(~30-55 ms)
+     4. first paint + EndDraw         (~25-40 ms)
+
+   Everything expensive that the app only needs later - COM, WIC, file
+   dialogs, full-resolution decode - is deferred past the first frame and
+   runs on worker threads so the UI never blocks. */
+
+#define WIN32_LEAN_AND_MEAN
+#include "app.h"
+
 #include <dwmapi.h>
+#include <process.h>
 #include <shellapi.h>
 #include <shobjidl.h>
-#include <commctrl.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <wchar.h>
+#include <wincodec.h>
+#include <windowsx.h>
 
-#include "image.h"
+FusApp g_app;
 
-#pragma GCC diagnostic ignored "-Wunused-parameter"
+static HBRUSH g_erase_brush;
+static HCURSOR g_cursor_arrow;
+static HCURSOR g_cursor_hand;
+static HCURSOR g_cursor_cross;
+static bool g_tracking_leave;
 
-#define APP_CLASS L"FustimageWindow"
-#define APP_TITLE L"Fustimage"
-#define APP_VERSION L"0.1"
-#define TIMER_ANIM 1
-#define TIMER_TOOLTIP 2
-#define WM_APP_LOAD_DONE (WM_APP + 1)
-#define MAX_UNDO 64
-#define MAX_CONTROLS 32
-#define PI_F 3.14159265358979323846f
-#define LUMA_RELEASE(p)                                                        \
-    do {                                                                       \
-        if ((p) != NULL) {                                                     \
-            IUnknown *luma_rel_ = (IUnknown *)(p);                             \
-            luma_rel_->lpVtbl->Release(luma_rel_);                             \
-            (p) = NULL;                                                        \
-        }                                                                      \
-    } while (0)
+/* Optional timing log (set FUST_TIMING=<file> to dump phase timings). */
+static FILE *g_tlog;
+static uint64_t g_t0;
 
-typedef D2D1_COLOR_F Color;
-typedef D2D1_RECT_F Rect;
-typedef D2D1_POINT_2F Point;
+void fus_log_hr(const char *label, long hr) {
+    if (g_tlog == NULL) {
+        return;
+    }
+    fprintf(g_tlog, "%.2f\t%s %ld\n", (double)(GetTickCount64() - g_t0), label, hr);
+    fflush(g_tlog);
+}
 
-enum {
-    CTRL_NONE = -1,
-    CTRL_OPEN = 0,
-    CTRL_UNDO,
-    CTRL_REDO,
-    CTRL_EXPORT,
-    CTRL_COPY,
-    CTRL_ROT_L90,
-    CTRL_ROT_R90,
-    CTRL_ROT_L180,
-    CTRL_ROT_R180,
-    CTRL_FLIP_H,
-    CTRL_FLIP_V,
-    CTRL_RATIO_16_9,
-    CTRL_RATIO_1_1,
-    CTRL_RATIO_9_16,
-    CTRL_RATIO_4_3,
-    CTRL_RATIO_3_4,
-    CTRL_RATIO_3_2,
-    CTRL_RATIO_2_3,
-    CTRL_RATIO_FREE,
-    CTRL_APPLY_CROP,
-    CTRL_CANCEL_CROP,
-    CTRL_THEME,
-    CTRL_COUNT
-};
+static void tlog(const char *label) {
+    if (g_tlog == NULL) {
+        return;
+    }
+    fprintf(g_tlog, "%.2f\t%s\n",
+            (double)(GetTickCount64() - g_t0), label);
+    fflush(g_tlog);
+}
 
-typedef enum {
-    STYLE_PRIMARY,
-    STYLE_TONAL,
-    STYLE_CARD,
-    STYLE_RATIO,
-    STYLE_THEME,
-    STYLE_ACTIONS
-} ControlStyle;
-
-typedef enum {
-    ICON_NONE,
-    ICON_OPEN,
-    ICON_UNDO,
-    ICON_REDO,
-    ICON_EXPORT,
-    ICON_COPY,
-    ICON_ROTATE_L90,
-    ICON_ROTATE_R90,
-    ICON_ROTATE_L180,
-    ICON_ROTATE_R180,
-    ICON_FLIP_H,
-    ICON_FLIP_V,
-    ICON_CHECK,
-    ICON_CLOSE,
-    ICON_SUN,
-    ICON_MOON,
-    ICON_IMAGE,
-    ICON_CROP,
-    ICON_INFO,
-    ICON_ZOOM,
-    ICON_SPARKLE
-} IconKind;
-
-typedef struct {
-    Color surface;
-    Color surface_dim;
-    Color surface_bright;
-    Color container_lowest;
-    Color container_low;
-    Color container;
-    Color container_high;
-    Color container_highest;
-    Color on_surface;
-    Color on_surface_variant;
-    Color outline;
-    Color outline_variant;
-    Color primary;
-    Color on_primary;
-    Color primary_container;
-    Color on_primary_container;
-    Color secondary;
-    Color on_secondary;
-    Color secondary_container;
-    Color on_secondary_container;
-    Color tertiary;
-    Color on_tertiary;
-    Color tertiary_container;
-    Color on_tertiary_container;
-    Color error;
-    Color on_error;
-    Color error_container;
-    Color on_error_container;
-    Color inverse_surface;
-    Color inverse_on_surface;
-    Color canvas;
-    Color shadow;
-} LumaTheme;
-
-typedef struct {
-    int rotation;
-    LumaCrop crop;
-    bool mirror_h;
-    bool mirror_v;
-} LumaEdit;
-
-typedef struct {
-    int id;
-    Rect rect;
-    const wchar_t *label;
-    const wchar_t *tooltip;
-    IconKind icon;
-    ControlStyle style;
-    bool enabled;
-    bool selected;
-    bool scrolled;
-    bool icon_only;
-    int ratio_index;
-    float aspect;
-} LumaControl;
-
-typedef struct {
-    HWND hwnd;
-    HINSTANCE instance;
-    ID2D1Factory *d2d;
-    IDWriteFactory *dwrite;
-    ID2D1HwndRenderTarget *hwnd_rt;
-    ID2D1RenderTarget *rt;
-    ID2D1SolidColorBrush *brush;
-    ID2D1StrokeStyle *round_style;
-    ID2D1StrokeStyle *dash_style;
-    ID2D1Bitmap *bitmap;
-
-    IDWriteTextFormat *f_brand;
-    IDWriteTextFormat *f_h1;
-    IDWriteTextFormat *f_h2;
-    IDWriteTextFormat *f_title;
-    IDWriteTextFormat *f_body;
-    IDWriteTextFormat *f_body_strong;
-    IDWriteTextFormat *f_label;
-    IDWriteTextFormat *f_button;
-    IDWriteTextFormat *f_caption;
-    IDWriteTextFormat *f_tiny;
-
-    LumaTheme theme;
-    bool dark;
-    float dpi;
-    float width;
-    float height;
-    float sidebar_w;
-    float margin;
-    bool compact;
-    bool wide;
-
-    Rect sidebar;
-    Rect appbar;
-    Rect canvas;
-    float footer_h;
-    float footer_top;
-    float tools_top;
-    float tools_bottom;
-    float scroll_y;
-    float scroll_max;
-    float content_height;
-    float actions_y;
-    bool actions_pinned;
-    float rotation_header_y;
-    float rotation_cards_y;
-    float crop_header_y;
-    float crop_divider_y;
-    float crop_cards_y;
-    float crop_hint_y;
-    float crop_panel_top;
-    float crop_panel_height;
-    float theme_button_y;
-    bool crop_panel_visible;
-
-    LumaImage image;
-    bool has_image;
+static void tlog_open(void) {
     wchar_t path[MAX_PATH];
-    wchar_t display_name[160];
-    wchar_t format_name[16];
-    wchar_t size_text[32];
+    DWORD n = GetEnvironmentVariableW(L"FUST_TIMING", path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return;
+    }
+    g_t0 = GetTickCount64();
+    g_tlog = _wfopen(path, L"w");
+}
+static int g_debug_title;
+
+#define TIMER_ANIM 1
+#define WM_APP_RESULT (WM_APP + 1)
+
+/* Nodes lose their preview when the window is minimised or the D2D device is
+   lost; the RGB data stays in memory, so recovery is a text format rebuild at
+   worst. */
+enum { RES_LOADED = 1, RES_FILTERED, RES_EXPORTED };
+
+#define PREVIEW_MAX 1600u
+
+typedef struct {
+    int kind;
+    int gen;
+    int upgrade;                 /* hi-res pass on top of the preview */
+    bool ok;
+    LumaImage image;
+    wchar_t error[256];
+    wchar_t path[MAX_PATH];
+} Result;
+
+typedef struct {
+    int kind;
+    int gen;
+    int upgrade;
+    HWND hwnd;
+    wchar_t path[MAX_PATH];
+    wchar_t out_path[MAX_PATH];
+    UINT max_side;
+    bool gray;
+    bool invert;
+    LumaImage copy;              /* filter job: mutable copy of the preview */
     int rotation;
-    LumaCrop crop;
     bool mirror_h;
     bool mirror_v;
-    int initial_rotation;
-    LumaCrop initial_crop;
-    bool initial_mirror_h;
-    bool initial_mirror_v;
-    bool edited;
-    bool exported;
-    LumaEdit undo[MAX_UNDO];
-    int undo_count;
-    LumaEdit redo[MAX_UNDO];
-    int redo_count;
+    LumaCrop crop;
+} Job;
 
-    bool fit;
-    float zoom;
-    Point pan;
-    Rect image_rect;
-    bool image_visible;
-    float fit_scale;
-    float display_scale;
-    float view_pad;
+/* IID_IDWriteFactory is not exported by the linker script of every mingw
+   build, so the interface id is spelled out here. */
+static const IID k_iid_dwrite_factory = {
+    0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}};
 
-    bool crop_mode;
-    float crop_aspect;
-    int crop_preset;
-    int crop_drag;
-    Point drag_start;
-    LumaCrop drag_start_crop;
-    Rect drag_image_rect;
-    LumaEdit crop_before;
-    bool crop_before_valid;
+/* ------------------------------------------------------------------ helpers */
 
-    bool mouse_down;
-    float mouse_x;
-    float mouse_y;
-    int hover_id;
-    int pressed_id;
-    int focus_id;
-    bool focus_visible;
-    bool panning;
-    Point pan_start;
-    Point pan_origin;
-    int cursor_kind;
-
-    LumaControl controls[MAX_CONTROLS];
-    int control_count;
-
-    double now;
-    ULONGLONG last_tick;
-    float reveal;
-    bool anim_timer;
-    bool tooltip_timer;
-    ULONGLONG hover_since;
-
-    wchar_t toast[512];
-    bool toast_error;
-    bool toast_active;
-    double toast_start;
-    double toast_until;
-
-    bool loading;
-    wchar_t loading_name[160];
-    LONG load_id;
-    HANDLE load_thread;
-
-    bool closing;
-    wchar_t startup_path[MAX_PATH];
-    bool startup_dark;
-    bool startup_light;
-    wchar_t startup_crop[16];
-} LumaApp;
-
-static LumaApp g_app;
-
-typedef struct {
-    const wchar_t *label;
-    float aspect;
-    const wchar_t *tooltip;
-} RatioInfo;
-
-static const RatioInfo RATIOS[] = {
-    {L"16:9", 16.0f / 9.0f, L"裁剪为 16:9 宽屏"},
-    {L"1:1", 1.0f, L"裁剪为 1:1 方形"},
-    {L"9:16", 9.0f / 16.0f, L"裁剪为 9:16 竖屏"},
-    {L"4:3", 4.0f / 3.0f, L"裁剪为 4:3 经典比例"},
-    {L"3:4", 3.0f / 4.0f, L"裁剪为 3:4 竖幅"},
-    {L"3:2", 3.0f / 2.0f, L"裁剪为 3:2 摄影比例"},
-    {L"2:3", 2.0f / 3.0f, L"裁剪为 2:3 竖幅摄影"},
-    {L"∞", 0.0f, L"自由裁剪，拖动边角调整"},
-};
-
-static Color rgba(unsigned rgb, float alpha) {
-    Color c;
-    c.r = (float)((rgb >> 16) & 0xffu) / 255.0f;
-    c.g = (float)((rgb >> 8) & 0xffu) / 255.0f;
-    c.b = (float)(rgb & 0xffu) / 255.0f;
-    c.a = alpha;
-    return c;
+static uint64_t now64(void) {
+    return GetTickCount64();
 }
 
-static Color color_alpha(Color c, float alpha) {
-    c.a *= alpha;
-    return c;
-}
-
-static Color color_mix(Color a, Color b, float t) {
-    Color c;
-    c.r = a.r + (b.r - a.r) * t;
-    c.g = a.g + (b.g - a.g) * t;
-    c.b = a.b + (b.b - a.b) * t;
-    c.a = a.a + (b.a - a.a) * t;
-    return c;
-}
-
-static Rect rect_make(float left, float top, float right, float bottom) {
-    Rect r;
-    r.left = left;
-    r.top = top;
-    r.right = right;
-    r.bottom = bottom;
-    return r;
-}
-
-static Rect rect_inset(Rect r, float dx, float dy) {
-    return rect_make(r.left + dx, r.top + dy, r.right - dx, r.bottom - dy);
-}
-
-static Rect rect_offset(Rect r, float dx, float dy) {
-    return rect_make(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy);
-}
-
-static float rect_w(Rect r) { return r.right - r.left; }
-static float rect_h(Rect r) { return r.bottom - r.top; }
-static float rect_cx(Rect r) { return (r.left + r.right) * 0.5f; }
-static float rect_cy(Rect r) { return (r.top + r.bottom) * 0.5f; }
-static bool rect_contains(Rect r, float x, float y) {
-    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-}
-
-static Point point_make(float x, float y) {
-    Point p;
-    p.x = x;
-    p.y = y;
-    return p;
-}
-
-static float clampf(float v, float lo, float hi) {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-static void copy_utf16(wchar_t *dst, size_t cap, const wchar_t *src) {
-    if (cap == 0) return;
-    if (src == NULL) {
-        dst[0] = L'\0';
-        return;
-    }
-    wcsncpy(dst, src, cap - 1);
-    dst[cap - 1] = L'\0';
-}
-
-static void theme_light(LumaTheme *t) {
-    memset(t, 0, sizeof(*t));
-    t->surface = rgba(0xFCF8FF, 1.0f);
-    t->surface_dim = rgba(0xDCD6E8, 1.0f);
-    t->surface_bright = rgba(0xFFFBFF, 1.0f);
-    t->container_lowest = rgba(0xFFFFFF, 1.0f);
-    t->container_low = rgba(0xF7F2FC, 1.0f);
-    t->container = rgba(0xF1EBF7, 1.0f);
-    t->container_high = rgba(0xEBE4F2, 1.0f);
-    t->container_highest = rgba(0xE4DCEC, 1.0f);
-    t->on_surface = rgba(0x1C1B20, 1.0f);
-    t->on_surface_variant = rgba(0x48454E, 1.0f);
-    t->outline = rgba(0x79747E, 1.0f);
-    t->outline_variant = rgba(0xCAC4D0, 1.0f);
-    t->primary = rgba(0x5B57D1, 1.0f);
-    t->on_primary = rgba(0xFFFFFF, 1.0f);
-    t->primary_container = rgba(0xE4DEFF, 1.0f);
-    t->on_primary_container = rgba(0x181146, 1.0f);
-    t->secondary = rgba(0x006A67, 1.0f);
-    t->on_secondary = rgba(0xFFFFFF, 1.0f);
-    t->secondary_container = rgba(0xA6F0EC, 1.0f);
-    t->on_secondary_container = rgba(0x00201F, 1.0f);
-    t->tertiary = rgba(0x8B4B5F, 1.0f);
-    t->on_tertiary = rgba(0xFFFFFF, 1.0f);
-    t->tertiary_container = rgba(0xFFD9E2, 1.0f);
-    t->on_tertiary_container = rgba(0x3A071A, 1.0f);
-    t->error = rgba(0xBA1A1A, 1.0f);
-    t->on_error = rgba(0xFFFFFF, 1.0f);
-    t->error_container = rgba(0xFFDAD6, 1.0f);
-    t->on_error_container = rgba(0x410002, 1.0f);
-    t->inverse_surface = rgba(0x313035, 1.0f);
-    t->inverse_on_surface = rgba(0xF4EFF4, 1.0f);
-    t->canvas = rgba(0xF2EDF8, 1.0f);
-    t->shadow = rgba(0x1C1630, 0.22f);
-}
-
-static void theme_dark(LumaTheme *t) {
-    memset(t, 0, sizeof(*t));
-    t->surface = rgba(0x141218, 1.0f);
-    t->surface_dim = rgba(0x141218, 1.0f);
-    t->surface_bright = rgba(0x3B3743, 1.0f);
-    t->container_lowest = rgba(0x0F0D13, 1.0f);
-    t->container_low = rgba(0x1A181F, 1.0f);
-    t->container = rgba(0x201D25, 1.0f);
-    t->container_high = rgba(0x2A2730, 1.0f);
-    t->container_highest = rgba(0x35313B, 1.0f);
-    t->on_surface = rgba(0xE7E0E9, 1.0f);
-    t->on_surface_variant = rgba(0xCAC4D0, 1.0f);
-    t->outline = rgba(0x948F99, 1.0f);
-    t->outline_variant = rgba(0x4A454F, 1.0f);
-    t->primary = rgba(0xC9C1FF, 1.0f);
-    t->on_primary = rgba(0x2C276C, 1.0f);
-    t->primary_container = rgba(0x44408C, 1.0f);
-    t->on_primary_container = rgba(0xE4DEFF, 1.0f);
-    t->secondary = rgba(0x80D5D1, 1.0f);
-    t->on_secondary = rgba(0x003735, 1.0f);
-    t->secondary_container = rgba(0x00504D, 1.0f);
-    t->on_secondary_container = rgba(0x9CF1EC, 1.0f);
-    t->tertiary = rgba(0xFFB1C5, 1.0f);
-    t->on_tertiary = rgba(0x551D31, 1.0f);
-    t->tertiary_container = rgba(0x6C3347, 1.0f);
-    t->on_tertiary_container = rgba(0xFFD9E2, 1.0f);
-    t->error = rgba(0xFFB4AB, 1.0f);
-    t->on_error = rgba(0x690005, 1.0f);
-    t->error_container = rgba(0x93000A, 1.0f);
-    t->on_error_container = rgba(0xFFDAD6, 1.0f);
-    t->inverse_surface = rgba(0xE7E0E9, 1.0f);
-    t->inverse_on_surface = rgba(0x313035, 1.0f);
-    t->canvas = rgba(0x100E14, 1.0f);
-    t->shadow = rgba(0x000000, 0.45f);
-}
-
-static void apply_theme_to_window(void) {
-    BOOL use_dark = g_app.dark ? TRUE : FALSE;
-    COLORREF caption;
-    COLORREF text;
-    COLORREF border;
-    int corner = 2;
-
-    if (g_app.hwnd == NULL) return;
-    if (g_app.dark) theme_dark(&g_app.theme);
-    else theme_light(&g_app.theme);
-
-    caption = g_app.dark ? RGB(20, 18, 24) : RGB(252, 248, 255);
-    text = g_app.dark ? RGB(231, 224, 233) : RGB(28, 27, 32);
-    border = g_app.dark ? RGB(45, 41, 52) : RGB(220, 214, 232);
-    DwmSetWindowAttribute(g_app.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &use_dark, sizeof(use_dark));
-    DwmSetWindowAttribute(g_app.hwnd, DWMWA_CAPTION_COLOR, &caption,
-                          sizeof(caption));
-    DwmSetWindowAttribute(g_app.hwnd, DWMWA_TEXT_COLOR, &text, sizeof(text));
-    DwmSetWindowAttribute(g_app.hwnd, DWMWA_BORDER_COLOR, &border,
-                          sizeof(border));
-    DwmSetWindowAttribute(g_app.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
-                          sizeof(corner));
-    InvalidateRect(g_app.hwnd, NULL, FALSE);
-}
-
-static void show_toast(const wchar_t *text, bool error) {
-    copy_utf16(g_app.toast, 512, text);
-    g_app.toast_error = error;
-    g_app.toast_active = true;
-    g_app.toast_start = g_app.now;
-    g_app.toast_until = g_app.now + (error ? 5.0 : 3.6);
-    SetTimer(g_app.hwnd, TIMER_ANIM, 16, NULL);
-    g_app.anim_timer = true;
-    InvalidateRect(g_app.hwnd, NULL, FALSE);
-}
-
-static float text_width(const wchar_t *text, IDWriteTextFormat *format) {
-    IDWriteTextLayout *layout = NULL;
-    DWRITE_TEXT_METRICS metrics;
-    float width = 0.0f;
-    if (text == NULL || format == NULL || g_app.dwrite == NULL) return 0.0f;
-    if (SUCCEEDED(g_app.dwrite->lpVtbl->CreateTextLayout(
-            g_app.dwrite, text, (UINT32)wcslen(text), format, 4096.0f,
-            200.0f, &layout)) &&
-        layout != NULL) {
-        if (SUCCEEDED(layout->lpVtbl->GetMetrics(layout, &metrics))) {
-            width = metrics.widthIncludingTrailingWhitespace;
+static void set_erase_brush(FusApp *app) {
+    D2D1_COLOR_F c = app->theme.surface;
+    HBRUSH brush = CreateSolidBrush(
+        RGB((BYTE)(c.r * 255.0f + 0.5f), (BYTE)(c.g * 255.0f + 0.5f),
+            (BYTE)(c.b * 255.0f + 0.5f)));
+    if (brush != NULL) {
+        if (g_erase_brush != NULL) {
+            DeleteObject(g_erase_brush);
         }
-        layout->lpVtbl->Release(layout);
-    }
-    return width;
-}
-
-static IDWriteTextFormat *make_format(const wchar_t *family,
-                                      DWRITE_FONT_WEIGHT weight, float size) {
-    IDWriteTextFormat *format = NULL;
-    HRESULT hr;
-    if (g_app.dwrite == NULL) return NULL;
-    hr = g_app.dwrite->lpVtbl->CreateTextFormat(
-        g_app.dwrite, family, NULL, weight, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, size, L"zh-CN", &format);
-    if (FAILED(hr) || format == NULL) {
-        format = NULL;
-        hr = g_app.dwrite->lpVtbl->CreateTextFormat(
-            g_app.dwrite, L"Microsoft YaHei UI", NULL, weight,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size,
-            L"zh-CN", &format);
-    }
-    if (FAILED(hr) || format == NULL) {
-        format = NULL;
-        hr = g_app.dwrite->lpVtbl->CreateTextFormat(
-            g_app.dwrite, L"Segoe UI", NULL, weight,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size,
-            L"zh-CN", &format);
-    }
-    if (FAILED(hr) || format == NULL) return NULL;
-    format->lpVtbl->SetWordWrapping(format, DWRITE_WORD_WRAPPING_NO_WRAP);
-    return format;
-}
-
-static bool create_text_formats(void) {
-    g_app.f_brand = make_format(L"Segoe UI Variable Display",
-                                DWRITE_FONT_WEIGHT_BOLD, 21.0f);
-    g_app.f_h1 = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                             25.0f);
-    g_app.f_h2 = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                             18.0f);
-    g_app.f_title = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                15.0f);
-    g_app.f_body = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_NORMAL,
-                               12.5f);
-    g_app.f_body_strong =
-        make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_MEDIUM, 12.5f);
-    g_app.f_label = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_MEDIUM,
-                                11.5f);
-    g_app.f_button = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                 12.5f);
-    g_app.f_caption = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_NORMAL,
-                                  10.5f);
-    g_app.f_tiny = make_format(L"Noto Sans SC", DWRITE_FONT_WEIGHT_MEDIUM,
-                               9.0f);
-    return g_app.f_brand && g_app.f_h1 && g_app.f_h2 && g_app.f_title &&
-           g_app.f_body && g_app.f_body_strong && g_app.f_label &&
-           g_app.f_button && g_app.f_caption && g_app.f_tiny;
-}
-
-static void set_brush(Color color) {
-    if (g_app.brush != NULL) {
-        g_app.brush->lpVtbl->SetColor(g_app.brush, &color);
+        g_erase_brush = brush;
     }
 }
 
-#define UI_BRUSH ((ID2D1Brush *)g_app.brush)
-
-static void fill_rect(Rect r, Color color) {
-    set_brush(color);
-    g_app.rt->lpVtbl->FillRectangle(g_app.rt, &r, UI_BRUSH);
+/* Image-space point -> dp point on screen, using the same matrix as ui.c. */
+static void image_to_screen(FusApp *app, float ix, float iy, float *sx,
+                            float *sy) {
+    D2D1_MATRIX_3X2_F m = ui_image_matrix(app);
+    *sx = m._11 * ix + m._21 * iy + m._31;
+    *sy = m._12 * ix + m._22 * iy + m._32;
 }
 
-static void fill_rounded(Rect r, float radius, Color color) {
-    D2D1_ROUNDED_RECT rr;
-    float max_radius = rect_w(r) < rect_h(r) ? rect_w(r) / 2.0f : rect_h(r) / 2.0f;
-    if (radius > max_radius) radius = max_radius;
-    if (radius < 0.0f) radius = 0.0f;
-    rr.rect = r;
-    rr.radiusX = radius;
-    rr.radiusY = radius;
-    set_brush(color);
-    g_app.rt->lpVtbl->FillRoundedRectangle(g_app.rt, &rr, UI_BRUSH);
-}
-
-static void stroke_rounded(Rect r, float radius, Color color, float width,
-                           ID2D1StrokeStyle *style) {
-    D2D1_ROUNDED_RECT rr;
-    float max_radius = rect_w(r) < rect_h(r) ? rect_w(r) / 2.0f : rect_h(r) / 2.0f;
-    if (radius > max_radius) radius = max_radius;
-    if (radius < 0.0f) radius = 0.0f;
-    rr.rect = r;
-    rr.radiusX = radius;
-    rr.radiusY = radius;
-    set_brush(color);
-    g_app.rt->lpVtbl->DrawRoundedRectangle(g_app.rt, &rr, UI_BRUSH, width,
-                                           style);
-}
-
-static void stroke_rect(Rect r, Color color, float width) {
-    set_brush(color);
-    g_app.rt->lpVtbl->DrawRectangle(g_app.rt, &r, UI_BRUSH, width, NULL);
-}
-
-static void fill_ellipse(float cx, float cy, float rx, float ry, Color color) {
-    D2D1_ELLIPSE e;
-    e.point.x = cx;
-    e.point.y = cy;
-    e.radiusX = rx;
-    e.radiusY = ry;
-    set_brush(color);
-    g_app.rt->lpVtbl->FillEllipse(g_app.rt, &e, UI_BRUSH);
-}
-
-static void stroke_ellipse(float cx, float cy, float rx, float ry, Color color,
-                           float width) {
-    D2D1_ELLIPSE e;
-    e.point.x = cx;
-    e.point.y = cy;
-    e.radiusX = rx;
-    e.radiusY = ry;
-    set_brush(color);
-    g_app.rt->lpVtbl->DrawEllipse(g_app.rt, &e, UI_BRUSH, width,
-                                  g_app.round_style);
-}
-
-static void line(float x1, float y1, float x2, float y2, Color color,
-                 float width) {
-    Point a = point_make(x1, y1);
-    Point b = point_make(x2, y2);
-    set_brush(color);
-    g_app.rt->lpVtbl->DrawLine(g_app.rt, a, b, UI_BRUSH, width,
-                               g_app.round_style);
-}
-
-static void draw_text_raw(const wchar_t *text, IDWriteTextFormat *format,
-                          Rect r, Color color, int align, int valign,
-                          bool wrap, bool clip) {
-    int length;
-    if (text == NULL || format == NULL) return;
-    length = (int)wcslen(text);
-    if (length <= 0) return;
-    format->lpVtbl->SetTextAlignment(
-        format, align == 1 ? DWRITE_TEXT_ALIGNMENT_CENTER
-                           : (align == 2 ? DWRITE_TEXT_ALIGNMENT_TRAILING
-                                         : DWRITE_TEXT_ALIGNMENT_LEADING));
-    format->lpVtbl->SetParagraphAlignment(
-        format, valign == 1 ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER
-                            : (valign == 2 ? DWRITE_PARAGRAPH_ALIGNMENT_FAR
-                                           : DWRITE_PARAGRAPH_ALIGNMENT_NEAR));
-    format->lpVtbl->SetWordWrapping(
-        format, wrap ? DWRITE_WORD_WRAPPING_WRAP
-                     : DWRITE_WORD_WRAPPING_NO_WRAP);
-    set_brush(color);
-    if (clip) {
-        Rect clip_rect = r;
-        g_app.rt->lpVtbl->PushAxisAlignedClip(g_app.rt, &clip_rect,
-                                              D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    }
-    g_app.rt->lpVtbl->DrawText(g_app.rt, text, (UINT32)length, format, &r,
-                               UI_BRUSH, D2D1_DRAW_TEXT_OPTIONS_NONE,
-                               DWRITE_MEASURING_MODE_NATURAL);
-    if (clip) {
-        g_app.rt->lpVtbl->PopAxisAlignedClip(g_app.rt);
-    }
-}
-
-static void draw_text_trimmed(const wchar_t *text, IDWriteTextFormat *format,
-                              Rect r, Color color, bool middle) {
-    IDWriteTextLayout *layout = NULL;
-    IDWriteInlineObject *ellipsis = NULL;
-    DWRITE_TRIMMING trimming;
-    DWRITE_TEXT_METRICS metrics;
-    D2D1_POINT_2F origin;
-    if (text == NULL || format == NULL || text[0] == L'\0') return;
-    if (FAILED(g_app.dwrite->lpVtbl->CreateTextLayout(
-            g_app.dwrite, text, (UINT32)wcslen(text), format, rect_w(r),
-            rect_h(r), &layout)) ||
-        layout == NULL) {
-        return;
-    }
-    layout->lpVtbl->SetWordWrapping(layout, DWRITE_WORD_WRAPPING_NO_WRAP);
-    if (SUCCEEDED(g_app.dwrite->lpVtbl->CreateEllipsisTrimmingSign(
-            g_app.dwrite, format, &ellipsis))) {
-        trimming.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
-        trimming.delimiter = 0;
-        trimming.delimiterCount = 0;
-        layout->lpVtbl->SetTrimming(layout, &trimming, ellipsis);
-    }
-    layout->lpVtbl->GetMetrics(layout, &metrics);
-    origin.x = r.left;
-    origin.y = r.top;
-    if (middle) origin.y += (rect_h(r) - metrics.height) * 0.5f;
-    set_brush(color);
-    g_app.rt->lpVtbl->PushAxisAlignedClip(g_app.rt, &r,
-                                          D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    g_app.rt->lpVtbl->DrawTextLayout(g_app.rt, origin, layout, UI_BRUSH,
-                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    g_app.rt->lpVtbl->PopAxisAlignedClip(g_app.rt);
-    if (ellipsis != NULL) ellipsis->lpVtbl->Release(ellipsis);
-    layout->lpVtbl->Release(layout);
-}
-
-typedef struct {
-    ID2D1Layer *layer;
-    ID2D1RoundedRectangleGeometry *geometry;
-} RoundClip;
-
-static RoundClip push_round_clip(Rect r, float radius) {
-    RoundClip clip;
-    D2D1_ROUNDED_RECT rounded;
-    D2D1_LAYER_PARAMETERS params;
-    clip.layer = NULL;
-    clip.geometry = NULL;
-    rounded.rect = r;
-    rounded.radiusX = radius;
-    rounded.radiusY = radius;
-    if (g_app.d2d == NULL || g_app.rt == NULL) return clip;
-    if (FAILED(g_app.d2d->lpVtbl->CreateRoundedRectangleGeometry(
-            g_app.d2d, &rounded, &clip.geometry)) ||
-        clip.geometry == NULL) {
-        return clip;
-    }
-    if (FAILED(g_app.rt->lpVtbl->CreateLayer(g_app.rt, NULL, &clip.layer)) ||
-        clip.layer == NULL) {
-        LUMA_RELEASE(clip.geometry);
-        return clip;
-    }
-    memset(&params, 0, sizeof(params));
-    params.contentBounds = r;
-    params.geometricMask = (ID2D1Geometry *)clip.geometry;
-    params.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-    params.maskTransform._11 = 1.0f;
-    params.maskTransform._22 = 1.0f;
-    params.opacity = 1.0f;
-    g_app.rt->lpVtbl->PushLayer(g_app.rt, &params, clip.layer);
-    return clip;
-}
-
-static void pop_round_clip(RoundClip *clip) {
-    if (clip->layer != NULL) {
-        g_app.rt->lpVtbl->PopLayer(g_app.rt);
-        LUMA_RELEASE(clip->layer);
-    }
-    LUMA_RELEASE(clip->geometry);
-}
-
-static void draw_soft_shadow(Rect r, float radius, float strength) {
-    int i;
-    for (i = 4; i >= 1; --i) {
-        Rect s = rect_offset(rect_inset(r, -(float)i * 2.2f, -(float)i * 1.4f),
-                             0.0f, (float)i * 1.8f);
-        fill_rounded(s, radius + (float)i * 1.6f,
-                     color_alpha(g_app.theme.shadow,
-                                 strength * (0.10f / (float)i)));
-    }
-}
-
-static void sink_add_bezier(ID2D1GeometrySink *sink,
-                            const D2D1_BEZIER_SEGMENT *segment) {
-    ID2D1GeometrySink_AddBezier(sink, segment);
-}
-
-static void fill_triangle(Point a, Point b, Point c, Color color) {
-    ID2D1PathGeometry *path = NULL;
-    ID2D1GeometrySink *sink = NULL;
-    if (FAILED(g_app.d2d->lpVtbl->CreatePathGeometry(g_app.d2d, &path)) ||
-        path == NULL) {
-        return;
-    }
-    if (FAILED(path->lpVtbl->Open(path, &sink)) || sink == NULL) {
-        LUMA_RELEASE(path);
-        return;
-    }
-    ID2D1GeometrySink_BeginFigure(sink, a, D2D1_FIGURE_BEGIN_FILLED);
-    ID2D1GeometrySink_AddLine(sink, b);
-    ID2D1GeometrySink_AddLine(sink, c);
-    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
-    ID2D1GeometrySink_Close(sink);
-    LUMA_RELEASE(sink);
-    set_brush(color);
-    g_app.rt->lpVtbl->FillGeometry(g_app.rt, (ID2D1Geometry *)path,
-                                   UI_BRUSH, NULL);
-    LUMA_RELEASE(path);
-}
-
-static void draw_arc(float cx, float cy, float radius, float start_deg,
-                     float sweep_deg, Color color, float width) {
-    ID2D1PathGeometry *path = NULL;
-    ID2D1GeometrySink *sink = NULL;
-    D2D1_ARC_SEGMENT arc;
-    Point start;
-    Point end;
-    float start_rad = start_deg * PI_F / 180.0f;
-    float end_rad = (start_deg + sweep_deg) * PI_F / 180.0f;
-    if (FAILED(g_app.d2d->lpVtbl->CreatePathGeometry(g_app.d2d, &path)) ||
-        path == NULL) {
-        return;
-    }
-    if (FAILED(path->lpVtbl->Open(path, &sink)) || sink == NULL) {
-        LUMA_RELEASE(path);
-        return;
-    }
-    start.x = cx + cosf(start_rad) * radius;
-    start.y = cy + sinf(start_rad) * radius;
-    end.x = cx + cosf(end_rad) * radius;
-    end.y = cy + sinf(end_rad) * radius;
-    ID2D1GeometrySink_BeginFigure(sink, start, D2D1_FIGURE_BEGIN_HOLLOW);
-    memset(&arc, 0, sizeof(arc));
-    arc.point = end;
-    arc.size.width = radius;
-    arc.size.height = radius;
-    arc.rotationAngle = 0.0f;
-    arc.sweepDirection = sweep_deg >= 0.0f
-                             ? D2D1_SWEEP_DIRECTION_CLOCKWISE
-                             : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
-    arc.arcSize = fabsf(sweep_deg) > 180.0f ? D2D1_ARC_SIZE_LARGE
-                                            : D2D1_ARC_SIZE_SMALL;
-    ID2D1GeometrySink_AddArc(sink, &arc);
-    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
-    ID2D1GeometrySink_Close(sink);
-    LUMA_RELEASE(sink);
-    set_brush(color);
-    g_app.rt->lpVtbl->DrawGeometry(g_app.rt, (ID2D1Geometry *)path,
-                                   UI_BRUSH, width, g_app.round_style);
-    LUMA_RELEASE(path);
-}
-
-static void draw_arc_arrow(float cx, float cy, float radius, float start_deg,
-                           float sweep_deg, Color color, float width) {
-    float end_deg = start_deg + sweep_deg;
-    float rad = end_deg * PI_F / 180.0f;
-    float tangent = end_deg + (sweep_deg >= 0.0f ? 90.0f : -90.0f);
-    float trad = tangent * PI_F / 180.0f;
-    Point tip;
-    Point back;
-    Point wing_a;
-    Point wing_b;
-    Point p1;
-    Point p2;
-
-    draw_arc(cx, cy, radius, start_deg, sweep_deg, color, width);
-    tip.x = cx + cosf(rad) * radius + cosf(trad) * width * 2.4f;
-    tip.y = cy + sinf(rad) * radius + sinf(trad) * width * 2.4f;
-    back.x = cx + cosf(rad) * radius - cosf(trad) * width * 0.8f;
-    back.y = cy + sinf(rad) * radius - sinf(trad) * width * 0.8f;
-    p1.x = -sinf(trad) * width * 2.7f;
-    p1.y = cosf(trad) * width * 2.7f;
-    wing_a.x = back.x + p1.x;
-    wing_a.y = back.y + p1.y;
-    wing_b.x = back.x - p1.x;
-    wing_b.y = back.y - p1.y;
-    fill_triangle(tip, wing_a, wing_b, color);
-    (void)p2;
-}
-
-static void draw_logo_mark(Rect tile) {
-    float radius = rect_w(tile) * 0.32f;
-    float unit = rect_w(tile) / 40.0f;
-    float left = tile.left;
-    float top = tile.top;
-    fill_rounded(tile, radius, g_app.theme.primary);
-    fill_ellipse(tile.right - 9.0f * unit, tile.top + 9.0f * unit, 11.0f * unit,
-                 10.0f * unit, color_alpha(g_app.theme.primary_container, 0.18f));
-    fill_rounded(rect_make(left + 11.0f * unit, top + 8.0f * unit,
-                           left + 16.0f * unit, top + 29.0f * unit),
-                 2.2f * unit, g_app.theme.on_primary);
-    fill_rounded(rect_make(left + 11.0f * unit, top + 8.0f * unit,
-                           left + 27.0f * unit, top + 13.0f * unit),
-                 2.2f * unit, g_app.theme.on_primary);
-    fill_rounded(rect_make(left + 11.0f * unit, top + 17.0f * unit,
-                           left + 24.0f * unit, top + 22.0f * unit),
-                 2.2f * unit, g_app.theme.on_primary);
-    fill_ellipse(left + 29.0f * unit, top + 28.0f * unit, 2.4f * unit,
-                 2.4f * unit, g_app.theme.tertiary_container);
-}
-
-static void draw_icon(IconKind kind, Rect box, Color color) {
-    float s = fminf(rect_w(box), rect_h(box)) / 24.0f;
-    float ox = box.left + (rect_w(box) - 24.0f * s) * 0.5f;
-    float oy = box.top + (rect_h(box) - 24.0f * s) * 0.5f;
-    float stroke = fmaxf(1.25f, 1.75f * s);
-    float cx = ox + 12.0f * s;
-    float cy = oy + 12.0f * s;
-#define IX(v) (ox + (float)(v) * s)
-#define IY(v) (oy + (float)(v) * s)
-    switch (kind) {
-    case ICON_OPEN: {
-        Rect frame = rect_make(IX(3), IY(4), IX(21), IY(20));
-        stroke_rounded(frame, 2.6f * s, color, stroke, NULL);
-        stroke_ellipse(IX(8.5f), IY(9.0f), 1.4f * s, 1.4f * s, color, stroke);
-        line(IX(4.8f), IY(16.2f), IX(9.1f), IY(12.2f), color, stroke);
-        line(IX(9.1f), IY(12.2f), IX(12.4f), IY(15.4f), color, stroke);
-        line(IX(12.4f), IY(15.4f), IX(15.8f), IY(12.0f), color, stroke);
-        line(IX(15.8f), IY(12.0f), IX(19.2f), IY(15.1f), color, stroke);
-        break;
-    }
-    case ICON_UNDO:
-        draw_arc_arrow(cx, cy, 7.0f * s, 205.0f, -255.0f, color, stroke);
-        break;
-    case ICON_REDO:
-        draw_arc_arrow(cx, cy, 7.0f * s, 335.0f, 255.0f, color, stroke);
-        break;
-    case ICON_EXPORT:
-        line(IX(12), IY(3.4f), IX(12), IY(14.0f), color, stroke);
-        line(IX(8.2f), IY(10.4f), IX(12), IY(14.2f), color, stroke);
-        line(IX(15.8f), IY(10.4f), IX(12), IY(14.2f), color, stroke);
-        line(IX(4.8f), IY(15.4f), IX(4.8f), IY(19.5f), color, stroke);
-        line(IX(4.8f), IY(19.5f), IX(19.2f), IY(19.5f), color, stroke);
-        line(IX(19.2f), IY(15.4f), IX(19.2f), IY(19.5f), color, stroke);
-        break;
-    case ICON_COPY:
-        stroke_rounded(rect_make(IX(4.0f), IY(7.0f), IX(16.0f), IY(20.0f)),
-                       2.2f * s, color, stroke * 0.85f, NULL);
-        stroke_rounded(rect_make(IX(8.0f), IY(4.0f), IX(20.0f), IY(17.0f)),
-                       2.2f * s, color, stroke, NULL);
-        break;
-    case ICON_ROTATE_L90:
-        draw_arc_arrow(cx, cy, 7.2f * s, 340.0f, -100.0f, color, stroke);
-        line(IX(12), IY(12), IX(12), IY(12.5f), color, stroke);
-        break;
-    case ICON_ROTATE_R90:
-        draw_arc_arrow(cx, cy, 7.2f * s, 200.0f, 100.0f, color, stroke);
-        line(IX(12), IY(12), IX(12), IY(12.5f), color, stroke);
-        break;
-    case ICON_ROTATE_L180:
-        draw_arc_arrow(cx, cy, 7.2f * s, 340.0f, -210.0f, color, stroke);
-        break;
-    case ICON_ROTATE_R180:
-        draw_arc_arrow(cx, cy, 7.2f * s, 200.0f, 210.0f, color, stroke);
-        break;
-    case ICON_FLIP_H: {
-        float a;
-        for (a = 4.0f; a < 21.0f; a += 4.6f) {
-            line(IX(12.0f), IY(a), IX(12.0f), IY(a + 2.4f), color,
-                 1.35f * s);
+/* Duration of the theme cross-fade; overridable for slow-motion previews. */
+static float theme_fade_ms(void) {
+    static int cached;
+    static float value;
+    if (!cached && value == 0.0f) {
+        const wchar_t *env = _wgetenv(L"FUST_THEME_MS");
+        int v = env != NULL ? _wtoi(env) : 0;
+        value = v > 0 ? (float)v : 260.0f;
+        if (v <= 0) {
+            cached = 1;
         }
-        fill_triangle(point_make(IX(3.2f), IY(6.2f)),
-                      point_make(IX(3.2f), IY(17.8f)),
-                      point_make(IX(9.4f), IY(12.0f)), color);
-        fill_triangle(point_make(IX(20.8f), IY(6.2f)),
-                      point_make(IX(20.8f), IY(17.8f)),
-                      point_make(IX(14.6f), IY(12.0f)),
-                      color_alpha(color, 0.45f));
-        break;
     }
-    case ICON_FLIP_V: {
-        float a;
-        for (a = 4.0f; a < 21.0f; a += 4.6f) {
-            line(IX(a), IY(12.0f), IX(a + 2.4f), IY(12.0f), color,
-                 1.35f * s);
-        }
-        fill_triangle(point_make(IX(6.2f), IY(3.2f)),
-                      point_make(IX(17.8f), IY(3.2f)),
-                      point_make(IX(12.0f), IY(9.4f)), color);
-        fill_triangle(point_make(IX(6.2f), IY(20.8f)),
-                      point_make(IX(17.8f), IY(20.8f)),
-                      point_make(IX(12.0f), IY(14.6f)),
-                      color_alpha(color, 0.45f));
-        break;
-    }
-    case ICON_CHECK:
-        line(IX(4.8f), IY(12.4f), IX(9.8f), IY(17.2f), color, stroke + 0.35f * s);
-        line(IX(9.8f), IY(17.2f), IX(19.2f), IY(6.8f), color, stroke + 0.35f * s);
-        break;
-    case ICON_CLOSE:
-        line(IX(6.0f), IY(6.0f), IX(18.0f), IY(18.0f), color, stroke);
-        line(IX(18.0f), IY(6.0f), IX(6.0f), IY(18.0f), color, stroke);
-        break;
-    case ICON_SUN:
-        stroke_ellipse(cx, cy, 4.2f * s, 4.2f * s, color, stroke);
-        {
-            int i;
-            for (i = 0; i < 8; ++i) {
-                float a = (float)i * 45.0f * PI_F / 180.0f;
-                line(cx + cosf(a) * 7.0f * s, cy + sinf(a) * 7.0f * s,
-                     cx + cosf(a) * 9.4f * s, cy + sinf(a) * 9.4f * s, color,
-                     stroke);
+    return value;
+}
+
+static void tick(FusApp *app) {
+    app->now_ms = now64();
+    if (app->theme_anim) {
+        float a = (float)(app->now_ms - app->theme_ms) / theme_fade_ms();
+        float e;
+        if (a >= 1.0f) {
+            a = 1.0f;
+            app->theme_anim = false;
+            app->theme_mix = 1.0f;
+        } else {
+            if (a < 0.0f) {
+                a = 0.0f;
             }
+            app->theme_mix = a;
         }
-        break;
-    case ICON_MOON: {
-        ID2D1PathGeometry *path = NULL;
-        ID2D1GeometrySink *sink = NULL;
-        if (SUCCEEDED(g_app.d2d->lpVtbl->CreatePathGeometry(g_app.d2d, &path)) &&
-            path != NULL &&
-            SUCCEEDED(path->lpVtbl->Open(path, &sink)) && sink != NULL) {
-            ID2D1GeometrySink_BeginFigure(sink, point_make(IX(15.4f), IY(3.4f)),
-                                      D2D1_FIGURE_BEGIN_FILLED);
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){
-                          {IX(8.8f), IY(5.0f)},
-                          {IX(5.8f), IY(9.2f)},
-                          {IX(5.8f), IY(13.4f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){
-                          {IX(5.8f), IY(18.0f)},
-                          {IX(9.4f), IY(20.8f)},
-                          {IX(15.4f), IY(21.0f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){
-                          {IX(11.0f), IY(17.6f)},
-                          {IX(9.0f), IY(14.8f)},
-                          {IX(9.0f), IY(11.8f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){
-                          {IX(9.0f), IY(8.2f)},
-                          {IX(11.4f), IY(5.0f)},
-                          {IX(15.4f), IY(3.4f)}});
-            ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
-            ID2D1GeometrySink_Close(sink);
-            LUMA_RELEASE(sink);
-            set_brush(color);
-            g_app.rt->lpVtbl->FillGeometry(g_app.rt, (ID2D1Geometry *)path,
-                                           UI_BRUSH, NULL);
-            LUMA_RELEASE(path);
+        /* emphasized decelerate, the same easing the rest of the UI uses */
+        e = 1.0f - (1.0f - a) * (1.0f - a) * (1.0f - a);
+        theme_blend(&app->theme, &app->theme_from, &app->theme_to, e);
+    }
+    if (app->fade_active) {
+        float a = (float)(app->now_ms - app->fade_start_ms) / 220.0f;
+        if (a >= 1.0f) {
+            app->fade = 1.0f;
+            app->fade_active = false;
+        } else {
+            app->fade = a < 0.0f ? 0.0f : a;
         }
-        break;
     }
-    case ICON_IMAGE: {
-        stroke_rounded(rect_make(IX(3.5f), IY(4.5f), IX(20.5f), IY(19.5f)),
-                       2.5f * s, color, stroke, NULL);
-        stroke_ellipse(IX(9.0f), IY(9.2f), 1.5f * s, 1.5f * s, color, stroke);
-        line(IX(5.2f), IY(16.5f), IX(10.0f), IY(12.2f), color, stroke);
-        line(IX(10.0f), IY(12.2f), IX(13.4f), IY(15.3f), color, stroke);
-        line(IX(13.4f), IY(15.3f), IX(16.0f), IY(13.0f), color, stroke);
-        line(IX(16.0f), IY(13.0f), IX(19.0f), IY(16.0f), color, stroke);
-        break;
+    if (app->snackbar[0] != L'\0' && app->now_ms >= app->snackbar_until_ms) {
+        app->snackbar[0] = L'\0';
+        app->snackbar_action[0] = L'\0';
+        app->snackbar_action_id = ACT_NONE;
     }
-    case ICON_CROP:
-        line(IX(8.0f), IY(3.5f), IX(8.0f), IY(17.0f), color, stroke);
-        line(IX(8.0f), IY(17.0f), IX(20.5f), IY(17.0f), color, stroke);
-        line(IX(4.0f), IY(8.0f), IX(16.5f), IY(8.0f), color, stroke);
-        line(IX(16.5f), IY(8.0f), IX(16.5f), IY(21.0f), color, stroke);
-        break;
-    case ICON_INFO: {
-        float r = 8.2f * s;
-        stroke_ellipse(cx, cy, r, r, color, stroke);
-        fill_ellipse(cx, IY(8.2f), 1.15f * s, 1.15f * s, color);
-        line(cx, IY(11.0f), cx, IY(16.4f), color, stroke);
-        break;
-    }
-    case ICON_ZOOM:
-        stroke_ellipse(IX(10.2f), IY(10.2f), 5.8f * s, 5.8f * s, color, stroke);
-        line(IX(14.6f), IY(14.6f), IX(20.5f), IY(20.5f), color, stroke);
-        break;
-    case ICON_SPARKLE: {
-        ID2D1PathGeometry *path = NULL;
-        ID2D1GeometrySink *sink = NULL;
-        if (SUCCEEDED(g_app.d2d->lpVtbl->CreatePathGeometry(g_app.d2d, &path)) &&
-            path != NULL &&
-            SUCCEEDED(path->lpVtbl->Open(path, &sink)) && sink != NULL) {
-            ID2D1GeometrySink_BeginFigure(sink, point_make(IX(12.0f), IY(2.8f)),
-                                      D2D1_FIGURE_BEGIN_FILLED);
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){{IX(12.5f), IY(7.5f)},
-                                             {IX(13.5f), IY(9.0f)},
-                                             {IX(18.4f), IY(9.7f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){{IX(14.0f), IY(10.4f)},
-                                             {IX(12.8f), IY(12.0f)},
-                                             {IX(12.4f), IY(16.8f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){{IX(11.8f), IY(12.1f)},
-                                             {IX(10.7f), IY(10.5f)},
-                                             {IX(5.8f), IY(9.8f)}});
-            sink_add_bezier(
-                sink, &(D2D1_BEZIER_SEGMENT){{IX(10.2f), IY(9.1f)},
-                                             {IX(11.4f), IY(7.4f)},
-                                             {IX(12.0f), IY(2.8f)}});
-            ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
-            ID2D1GeometrySink_Close(sink);
-            LUMA_RELEASE(sink);
-            set_brush(color);
-            g_app.rt->lpVtbl->FillGeometry(g_app.rt, (ID2D1Geometry *)path,
-                                           UI_BRUSH, NULL);
-            LUMA_RELEASE(path);
-        }
-        break;
-    }
-    default:
-        break;
-    }
-#undef IX
-#undef IY
 }
 
-static void create_brush_resources(void) {
-    D2D1_STROKE_STYLE_PROPERTIES props;
-    if (g_app.rt == NULL) return;
-    LUMA_RELEASE(g_app.brush);
-    LUMA_RELEASE(g_app.round_style);
-    LUMA_RELEASE(g_app.dash_style);
-    g_app.rt->lpVtbl->CreateSolidColorBrush(g_app.rt, &(Color){0, 0, 0, 1},
-                                            NULL, &g_app.brush);
-    memset(&props, 0, sizeof(props));
-    props.startCap = D2D1_CAP_STYLE_ROUND;
-    props.endCap = D2D1_CAP_STYLE_ROUND;
-    props.dashCap = D2D1_CAP_STYLE_ROUND;
-    props.lineJoin = D2D1_LINE_JOIN_ROUND;
-    props.miterLimit = 10.0f;
-    props.dashStyle = D2D1_DASH_STYLE_SOLID;
-    g_app.d2d->lpVtbl->CreateStrokeStyle(g_app.d2d, &props, NULL, 0,
-                                         &g_app.round_style);
-    props.dashStyle = D2D1_DASH_STYLE_DASH;
-    props.dashOffset = 0.0f;
-    g_app.d2d->lpVtbl->CreateStrokeStyle(g_app.d2d, &props, NULL, 0,
-                                         &g_app.dash_style);
+static void ensure_timer(FusApp *app) {
+    if (ui_animation_active(app)) {
+        SetTimer(app->hwnd, TIMER_ANIM, 16, NULL);
+    } else {
+        KillTimer(app->hwnd, TIMER_ANIM);
+    }
 }
 
-static void upload_photo_bitmap(void) {
+/* --------------------------------------------------------------- undo stack */
+
+static FusDocState state_now(const FusApp *app) {
+    FusDocState s;
+    s.rotation = app->rotation;
+    s.mirror_h = app->mirror_h;
+    s.mirror_v = app->mirror_v;
+    s.grayscale = app->grayscale;
+    s.invert = app->invert;
+    s.crop = app->crop;
+    s.crop_preset = app->crop_preset;
+    return s;
+}
+
+/* Records the *current* state, i.e. call before mutating. */
+/* Record the *current* document state.  The undo array always holds states,
+   newest last, so undo/redo are plain moves along it. */
+static void history_commit(FusApp *app) {
+    FusDocState s = state_now(app);
+    int cap = (int)(sizeof app->undo / sizeof app->undo[0]);
+
+    app->undo_len = app->undo_pos + 1;
+    if (app->undo_len >= cap) {
+        memmove(&app->undo[0], &app->undo[1],
+                sizeof app->undo[0] * (size_t)(cap - 1));
+        app->undo_len = cap - 1;
+    }
+    app->undo[app->undo_len] = s;
+    app->undo_len++;
+    app->undo_pos = app->undo_len - 1;
+}
+
+/* ------------------------------------------------------------ async loading */
+
+static bool image_clone(const LumaImage *src, LumaImage *dst) {
+    dst->width = src->width;
+    dst->height = src->height;
+    dst->stride = src->stride;
+    dst->pixels = (uint8_t *)malloc((size_t)src->stride * src->height);
+    if (dst->pixels == NULL) {
+        dst->width = dst->height = dst->stride = 0;
+        return false;
+    }
+    memcpy(dst->pixels, src->pixels, (size_t)src->stride * src->height);
+    return true;
+}
+
+static unsigned __stdcall worker_main(void *arg) {
+    Job *job = (Job *)arg;
+    Result *res = (Result *)calloc(1, sizeof(Result));
+
+    if (res == NULL) {
+        free(job);
+        return 0;
+    }
+    res->kind = job->kind;
+    res->gen = job->gen;
+    res->upgrade = job->upgrade;
+
+    if (job->kind == RES_LOADED) {
+        res->ok = image_load_scaled(job->path, job->max_side, &res->image,
+                                    res->error,
+                                    sizeof res->error / sizeof res->error[0]);
+        wcsncpy(res->path, job->path, MAX_PATH - 1);
+    } else if (job->kind == RES_FILTERED) {
+        image_apply_filters(&job->copy, job->gray, job->invert);
+        res->image = job->copy;
+        res->ok = true;
+    } else {
+        LumaImage full;
+        ZeroMemory(&full, sizeof full);
+        res->ok = luma_image_load(job->path, &full, res->error,
+                                  sizeof res->error / sizeof res->error[0]);
+        if (res->ok) {
+            image_apply_filters(&full, job->gray, job->invert);
+            res->ok = luma_image_export(&full, job->rotation, job->mirror_h,
+                                        job->mirror_v, job->crop,
+                                        job->out_path, res->error,
+                                        sizeof res->error / sizeof res->error[0]);
+            luma_image_free(&full);
+        }
+        wcsncpy(res->path, job->out_path, MAX_PATH - 1);
+    }
+
+    if (res->ok || res->kind != RES_FILTERED) {
+        PostMessageW(job->hwnd, WM_APP_RESULT, 0, (LPARAM)res);
+    } else {
+        free(res);
+    }
+    free(job);
+    return 0;
+}
+
+static Job *job_new(int kind, int gen, HWND hwnd) {
+    Job *job = (Job *)calloc(1, sizeof(Job));
+    if (job != NULL) {
+        job->kind = kind;
+        job->gen = gen;
+        job->hwnd = hwnd;
+    }
+    return job;
+}
+
+static void start_load(const wchar_t *path) {
+    FusApp *app = &g_app;
+    Job *job = job_new(RES_LOADED, ++app->load_gen, app->hwnd);
+
+    if (job == NULL) {
+        return;
+    }
+    job->max_side = PREVIEW_MAX;
+    wcsncpy(job->path, path, MAX_PATH - 1);
+    app->loading = true;
+    tlog("load_start");
+    app->load_start_ms = now64();
+    app->cropping = false;
+    _beginthreadex(NULL, 0, worker_main, job, 0, NULL);
+    ui_invalidate(app);
+    ensure_timer(app);
+}
+
+/* Second pass: decode the file at full size in the background so 100% zoom is
+   crisp.  The preview stays on screen until the better pixels arrive. */
+static void start_upgrade(const wchar_t *path, int gen) {
+    FusApp *app = &g_app;
+    Job *job = job_new(RES_LOADED, gen, app->hwnd);
+
+    if (job == NULL) {
+        return;
+    }
+    job->upgrade = 1;
+    job->max_side = 8192u;
+    wcsncpy(job->path, path, MAX_PATH - 1);
+    _beginthreadex(NULL, 0, worker_main, job, 0, NULL);
+}
+
+static void start_filter(void) {
+    FusApp *app = &g_app;
+    Job *job;
+
+    if (app->have_base) {
+        job = job_new(RES_FILTERED, app->load_gen, app->hwnd);
+        if (job == NULL) {
+            return;
+        }
+        if (!image_clone(&app->base, &job->copy)) {
+            free(job);
+            return;
+        }
+        job->gray = app->grayscale;
+        job->invert = app->invert;
+        _beginthreadex(NULL, 0, worker_main, job, 0, NULL);
+    } else if (app->bitmap != NULL) {
+        fus_release(app->bitmap);
+        app->bitmap = NULL;
+        ui_invalidate(app);
+    }
+}
+
+static void start_export(const wchar_t *path) {
+    FusApp *app = &g_app;
+    Job *job;
+
+    if (!app->has_image) {
+        return;
+    }
+    job = job_new(RES_EXPORTED, app->load_gen, app->hwnd);
+    if (job == NULL) {
+        return;
+    }
+    wcsncpy(job->path, app->path, MAX_PATH - 1);
+    wcsncpy(job->out_path, path, MAX_PATH - 1);
+    job->rotation = app->rotation;
+    job->mirror_h = app->mirror_h;
+    job->mirror_v = app->mirror_v;
+    job->gray = app->grayscale;
+    job->invert = app->invert;
+    job->crop = app->crop;
+    app->exporting = true;
+    app->export_start_ms = now64();
+    _beginthreadex(NULL, 0, worker_main, job, 0, NULL);
+    ui_invalidate(app);
+    ensure_timer(app);
+}
+
+/* ------------------------------------------------------------- device setup */
+
+static void discard_target(FusApp *app) {
+    if (app->checker != NULL) {
+        fus_release(app->checker);
+        app->checker = NULL;
+    }
+    if (app->bitmap != NULL) {
+        fus_release(app->bitmap);
+        app->bitmap = NULL;
+    }
+    if (app->brush != NULL) {
+        fus_release(app->brush);
+        app->brush = NULL;
+    }
+    if (app->rt != NULL) {
+        fus_release(app->rt);
+        app->rt = NULL;
+    }
+}
+
+static bool upload_bitmap(FusApp *app, const LumaImage *img) {
     D2D1_BITMAP_PROPERTIES props;
     D2D1_SIZE_U size;
-    if (g_app.rt == NULL || !g_app.has_image || g_app.image.pixels == NULL) {
-        return;
+    HRESULT hr;
+
+    if (app->bitmap != NULL) {
+        fus_release(app->bitmap);
+        app->bitmap = NULL;
     }
-    LUMA_RELEASE(g_app.bitmap);
-    memset(&props, 0, sizeof(props));
+    if (app->rt == NULL || img == NULL || img->pixels == NULL) {
+        return false;
+    }
+    ZeroMemory(&props, sizeof props);
     props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
     props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
     props.dpiX = 96.0f;
     props.dpiY = 96.0f;
-    size.width = g_app.image.width;
-    size.height = g_app.image.height;
-    g_app.rt->lpVtbl->CreateBitmap(g_app.rt, size, g_app.image.pixels,
-                                   g_app.image.stride, &props, &g_app.bitmap);
+    size.width = img->width;
+    size.height = img->height;
+    hr = RT(app)->lpVtbl->CreateBitmap(RT(app), size, img->pixels, img->stride,
+                                       &props, &app->bitmap);
+    return SUCCEEDED(hr);
 }
 
-static void discard_device_resources(void) {
-    LUMA_RELEASE(g_app.bitmap);
-    LUMA_RELEASE(g_app.brush);
-    LUMA_RELEASE(g_app.round_style);
-    LUMA_RELEASE(g_app.dash_style);
-    g_app.rt = NULL;
-    LUMA_RELEASE(g_app.hwnd_rt);
+/* Paints a filtered copy without touching the pristine preview in app->base. */
+static void upload_filtered(FusApp *app) {
+    LumaImage copy;
+
+    if (!app->have_base || !upload_bitmap(app, &app->base)) {
+        return;
+    }
+    if (!app->grayscale && !app->invert) {
+        ui_invalidate(app);
+        return;
+    }
+    if (image_clone(&app->base, &copy)) {
+        image_apply_filters(&copy, app->grayscale, app->invert);
+        upload_bitmap(app, &copy);
+        luma_image_free(&copy);
+    }
+    ui_invalidate(app);
 }
 
-static bool create_device_resources(void) {
-    RECT rc;
+static HRESULT create_target(FusApp *app) {
     D2D1_RENDER_TARGET_PROPERTIES props;
     D2D1_HWND_RENDER_TARGET_PROPERTIES hwnd_props;
+    D2D1_SIZE_U pixel_size;
+    RECT rc;
+    float scale = app->dpi / 96.0f;
     HRESULT hr;
-    if (g_app.hwnd == NULL || g_app.d2d == NULL) return false;
-    discard_device_resources();
-    GetClientRect(g_app.hwnd, &rc);
-    memset(&props, 0, sizeof(props));
-    props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-    props.pixelFormat.format = DXGI_FORMAT_UNKNOWN;
-    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_UNKNOWN;
-    props.dpiX = g_app.dpi;
-    props.dpiY = g_app.dpi;
+
+    GetClientRect(app->hwnd, &rc);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) {
+        return E_FAIL;
+    }
+    ZeroMemory(&props, sizeof props);
+    props.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
+    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+    props.dpiX = 96.0f * scale;
+    props.dpiY = 96.0f * scale;
     props.usage = D2D1_RENDER_TARGET_USAGE_NONE;
     props.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
-    hwnd_props.hwnd = g_app.hwnd;
-    hwnd_props.pixelSize.width = (UINT)(rc.right > 0 ? rc.right : 1);
-    hwnd_props.pixelSize.height = (UINT)(rc.bottom > 0 ? rc.bottom : 1);
+
+    pixel_size.width = (UINT)(rc.right - rc.left);
+    pixel_size.height = (UINT)(rc.bottom - rc.top);
+    hwnd_props.hwnd = app->hwnd;
+    hwnd_props.pixelSize = pixel_size;
     hwnd_props.presentOptions = D2D1_PRESENT_OPTIONS_NONE;
-    hr = g_app.d2d->lpVtbl->CreateHwndRenderTarget(
-        g_app.d2d, &props, &hwnd_props, &g_app.hwnd_rt);
-    if (FAILED(hr) || g_app.hwnd_rt == NULL) {
-        g_app.hwnd_rt = NULL;
+
+    hr = app->d2d->lpVtbl->CreateHwndRenderTarget(app->d2d, &props,
+                                                  &hwnd_props, &app->rt);
+    if (FAILED(hr)) {
+        app->rt = NULL;
+        return hr;
+    }
+    RT(app)->lpVtbl->SetAntialiasMode(RT(app), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    RT(app)->lpVtbl->SetTextAntialiasMode(RT(app),
+                                          D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+    if (app->brush == NULL) {
+        D2D1_COLOR_F black = {0.0f, 0.0f, 0.0f, 1.0f};
+        hr = RT(app)->lpVtbl->CreateSolidColorBrush(RT(app), &black, NULL,
+                                                    &app->brush);
+        if (FAILED(hr)) {
+            return hr;
+        }
+    }
+    if (app->have_base) {
+        upload_filtered(app);
+    }
+    icons_get(app->d2d);
+    return S_OK;
+}
+
+static void update_title(FusApp *app) {
+    wchar_t title[300];
+
+    if (g_debug_title) {
+        return;
+    }
+    if (app->has_image && app->name[0] != L'\0') {
+        _snwprintf(title, 300, L"%s - Fustimage", app->name);
+    } else {
+        _snwprintf(title, 300, L"Fustimage");
+    }
+    SetWindowTextW(app->hwnd, title);
+}
+
+static void paint_client(FusApp *app) {
+    if (app->rt == NULL) {
+        return;
+    }
+    tick(app);
+    ui_paint(app);
+    tlog(app->dark ? "paint_dark" : "paint_light");
+
+    if (g_debug_title) {
+        wchar_t buf[256];
+        _snwprintf(buf, 256,
+                 L"[dbg] fit=%d zoom=%.3f crop=%.3f,%.3f,%.3f,%.3f pre=%d "
+                 L"cr=%d pan=%.1f,%.1f cw=%.3f,%.3f,%.3f,%.3f drag=%d rot=%d dark=%d",
+                 app->fit ? 1 : 0, (double)app->zoom, (double)app->crop.left,
+                 (double)app->crop.top, (double)app->crop.right,
+                 (double)app->crop.bottom, app->crop_preset,
+                 app->cropping ? 1 : 0, (double)app->pan_x,
+                 (double)app->pan_y, (double)app->crop_work[0],
+                 (double)app->crop_work[1], (double)app->crop_work[2],
+                 (double)app->crop_work[3], app->panning ? 1 : 0,
+                 (int)app->rotation, app->dark ? 1 : 0);
+        SetWindowTextW(app->hwnd, buf);
+    }
+}
+
+/* ------------------------------------------------------------------- theme */
+
+static void toggle_theme(void) {
+    FusApp *app = &g_app;
+    BOOL dark;
+
+    app->theme_from = app->theme;
+    app->dark = !app->dark;
+    theme_build(&app->theme_to, app->dark);
+    app->theme_anim = true;
+    app->theme_mix = 0.0f;
+    app->theme_ms = now64();
+    set_erase_brush(app);
+    if (app->checker != NULL) {
+        fus_release(app->checker);
+        app->checker = NULL;
+    }
+    dark = app->dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(app->hwnd, 20, &dark, sizeof dark);
+    tlog(app->dark ? "theme_dark" : "theme_light");
+    ensure_timer(app);
+    InvalidateRect(app->hwnd, NULL, FALSE);
+}
+
+/* --------------------------------------------------------------- dialogs */
+
+static void ensure_com(void) {
+    static bool initialized = false;
+    if (!initialized) {
+        if (SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE))) {
+            initialized = true;
+        }
+    }
+}
+
+static bool pick_open(wchar_t *out, size_t cap) {
+    IFileOpenDialog *dialog = NULL;
+    IShellItem *item = NULL;
+    PWSTR path = NULL;
+    COMDLG_FILTERSPEC types[2];
+    bool ok = false;
+
+    ensure_com();
+    if (FAILED(CoCreateInstance(&CLSID_FileOpenDialog, NULL,
+                                CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog,
+                                (void **)&dialog))) {
         return false;
     }
-    g_app.rt = (ID2D1RenderTarget *)g_app.hwnd_rt;
-    g_app.rt->lpVtbl->SetAntialiasMode(g_app.rt,
-                                       D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    g_app.rt->lpVtbl->SetTextAntialiasMode(g_app.rt,
-                                           D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-    create_brush_resources();
-    upload_photo_bitmap();
-    return g_app.brush != NULL;
+    types[0].pszName = L"图片";
+    types[0].pszSpec = L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff";
+    types[1].pszName = L"所有文件";
+    types[1].pszSpec = L"*.*";
+    dialog->lpVtbl->SetFileTypes(dialog, 2, types);
+    if (SUCCEEDED(dialog->lpVtbl->Show(dialog, g_app.hwnd)) &&
+        SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &item))) {
+        if (SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH,
+                                                  &path)) &&
+            path != NULL) {
+            wcsncpy(out, path, cap - 1);
+            out[cap - 1] = L'\0';
+            ok = true;
+            CoTaskMemFree(path);
+        }
+        fus_release(item);
+    }
+    fus_release(dialog);
+    return ok;
 }
 
-static LumaControl *add_control(int id, Rect rect, const wchar_t *label,
-                                const wchar_t *tooltip, IconKind icon,
-                                ControlStyle style) {
-    LumaControl *c;
-    if (g_app.control_count >= MAX_CONTROLS) return NULL;
-    c = &g_app.controls[g_app.control_count++];
-    memset(c, 0, sizeof(*c));
-    c->id = id;
-    c->rect = rect;
-    c->label = label;
-    c->tooltip = tooltip;
-    c->icon = icon;
-    c->style = style;
-    c->enabled = true;
-    c->ratio_index = -1;
-    return c;
+static const wchar_t *extension_for_type(UINT type_index) {
+    switch (type_index) {
+    case 2: return L".jpg";
+    case 3: return L".bmp";
+    case 4: return L".tif";
+    default: return L".png";
+    }
 }
 
-static LumaControl *find_control(int id) {
-    int i;
-    for (i = 0; i < g_app.control_count; ++i) {
-        if (g_app.controls[i].id == id) return &g_app.controls[i];
+static bool pick_save(wchar_t *out, size_t cap) {
+    IFileSaveDialog *dialog = NULL;
+    IShellItem *item = NULL;
+    PWSTR path = NULL;
+    COMDLG_FILTERSPEC types[4];
+    UINT type_index = 1;
+    bool ok = false;
+
+    ensure_com();
+    if (FAILED(CoCreateInstance(&CLSID_FileSaveDialog, NULL,
+                                CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog,
+                                (void **)&dialog))) {
+        return false;
     }
-    return NULL;
-}
+    types[0].pszName = L"PNG";
+    types[0].pszSpec = L"*.png";
+    types[1].pszName = L"JPEG";
+    types[1].pszSpec = L"*.jpg;*.jpeg";
+    types[2].pszName = L"BMP";
+    types[2].pszSpec = L"*.bmp";
+    types[3].pszName = L"TIFF";
+    types[3].pszSpec = L"*.tif;*.tiff";
+    dialog->lpVtbl->SetFileTypes(dialog, 4, types);
+    dialog->lpVtbl->SetDefaultExtension(dialog, L"png");
+    {
+        wchar_t suggestion[MAX_PATH];
+        const wchar_t *dot;
 
-static void layout_app(void) {
-    float w = g_app.width;
-    float h = g_app.height;
-    float gap;
-    float cw;
-    float x;
-    float y;
-    float content_start;
-    float content_end;
-    float viewport_h;
-    float new_scroll;
-    float delta;
-    int i;
-    LumaControl *c;
-
-    g_app.compact = w < 820.0f;
-    g_app.wide = w >= 1180.0f;
-    g_app.sidebar_w = g_app.compact ? 96.0f : (g_app.wide ? 320.0f : 272.0f);
-    g_app.margin = g_app.compact ? 16.0f : 20.0f;
-    g_app.sidebar = rect_make(0.0f, 0.0f, g_app.sidebar_w, h);
-    g_app.appbar = rect_make(g_app.sidebar_w, 0.0f, w, 72.0f);
-    g_app.canvas = rect_make(g_app.sidebar_w, 72.0f, w, h);
-    g_app.footer_h = g_app.compact ? 60.0f : 68.0f;
-    g_app.footer_top = h - g_app.footer_h;
-    g_app.crop_panel_visible = g_app.crop_mode && g_app.has_image;
-    g_app.crop_panel_height = g_app.compact ? 118.0f : 108.0f;
-    g_app.crop_panel_top = g_app.footer_top - g_app.crop_panel_height;
-    if (!g_app.crop_panel_visible) g_app.crop_panel_top = g_app.footer_top;
-    g_app.actions_y = 136.0f;
-    g_app.tools_top = g_app.compact ? 134.0f
-                                   : (g_app.actions_y + 44.0f + 16.0f);
-    g_app.tools_bottom = (g_app.crop_panel_visible ? g_app.crop_panel_top
-                                                  : g_app.footer_top) -
-                         8.0f;
-    if (g_app.tools_bottom < g_app.tools_top + 40.0f) {
-        g_app.tools_bottom = g_app.tools_top + 40.0f;
+        wcsncpy(suggestion, g_app.name[0] != L'\0' ? g_app.name : L"image",
+                MAX_PATH - 1);
+        suggestion[MAX_PATH - 1] = L'\0';
+        dot = wcsrchr(suggestion, L'.');
+        if (dot != NULL && wcslen(dot) <= 5) {
+            suggestion[dot - suggestion] = L'\0';
+        }
+        dialog->lpVtbl->SetFileName(dialog, suggestion);
     }
-    g_app.view_pad = g_app.compact ? 24.0f : 48.0f;
-    g_app.control_count = 0;
-    g_app.actions_pinned = !g_app.compact;
-
-    cw = g_app.sidebar_w - g_app.margin * 2.0f;
-    x = g_app.margin;
-
-    c = add_control(CTRL_OPEN,
-                    rect_make(x, g_app.compact ? 70.0f : 76.0f, x + cw,
-                              (g_app.compact ? 70.0f : 76.0f) + 50.0f),
-                    L"打开图片", L"打开图片  (Ctrl+O)", ICON_OPEN,
-                    STYLE_PRIMARY);
-    if (c) {
-        c->enabled = !g_app.loading;
-        c->icon_only = true;
-    }
-
-    if (!g_app.compact) {
-        float bw = (cw - 24.0f) / 4.0f;
-        c = add_control(CTRL_UNDO,
-                        rect_make(x, g_app.actions_y, x + bw,
-                                  g_app.actions_y + 44.0f),
-                        L"撤销", L"撤销  (Ctrl+Z)", ICON_UNDO, STYLE_ACTIONS);
-        if (c) c->enabled = g_app.undo_count > 0;
-        c = add_control(CTRL_REDO,
-                        rect_make(x + bw + 8.0f, g_app.actions_y,
-                                  x + bw * 2.0f + 8.0f,
-                                  g_app.actions_y + 44.0f),
-                        L"重做", L"重做  (Ctrl+Y)", ICON_REDO, STYLE_ACTIONS);
-        if (c) c->enabled = g_app.redo_count > 0;
-        c = add_control(CTRL_EXPORT,
-                        rect_make(x + (bw + 8.0f) * 2.0f, g_app.actions_y,
-                                  x + (bw + 8.0f) * 2.0f + bw,
-                                  g_app.actions_y + 44.0f),
-                        L"导出", L"导出图片  (Ctrl+S)", ICON_EXPORT,
-                        STYLE_ACTIONS);
-        if (c) c->enabled = g_app.has_image && !g_app.loading;
-        c = add_control(CTRL_COPY,
-                        rect_make(x + (bw + 8.0f) * 3.0f, g_app.actions_y,
-                                  x + cw, g_app.actions_y + 44.0f),
-                        L"复制", L"复制到原图旁边（不覆盖原图）", ICON_COPY,
-                        STYLE_ACTIONS);
-        if (c) c->enabled = g_app.has_image && !g_app.loading;
-    }
-
-    /* Tool content, placed inside the scrollable viewport. */
-    y = g_app.tools_top - g_app.scroll_y + 2.0f;
-    content_start = y;
-    gap = g_app.compact ? 8.0f : 10.0f;
-
-    if (g_app.compact) {
-        for (i = 0; i < 4; ++i) {
-            const wchar_t *label = i == 0 ? L"撤销"
-                                : i == 1 ? L"重做"
-                                : i == 2 ? L"导出"
-                                         : L"复制";
-            const wchar_t *tip = i == 0 ? L"撤销  (Ctrl+Z)"
-                              : i == 1 ? L"重做  (Ctrl+Y)"
-                              : i == 2 ? L"导出图片  (Ctrl+S)"
-                                       : L"复制到原图旁边（不覆盖原图）";
-            IconKind icon = i == 0 ? ICON_UNDO
-                          : i == 1 ? ICON_REDO
-                          : i == 2 ? ICON_EXPORT
-                                   : ICON_COPY;
-            int id = i == 0 ? CTRL_UNDO
-                   : i == 1 ? CTRL_REDO
-                   : i == 2 ? CTRL_EXPORT
-                            : CTRL_COPY;
-            c = add_control(id, rect_make(x, y, x + cw, y + 44.0f), label, tip,
-                            icon, STYLE_ACTIONS);
-            if (c) {
-                c->scrolled = true;
-                if (c->id == CTRL_UNDO) c->enabled = g_app.undo_count > 0;
-                if (c->id == CTRL_REDO) c->enabled = g_app.redo_count > 0;
-                if (c->id == CTRL_EXPORT || c->id == CTRL_COPY) {
-                    c->enabled = g_app.has_image && !g_app.loading;
+    if (g_app.path[0] != L'\0') {
+        wchar_t folder_path[MAX_PATH];
+        wcsncpy(folder_path, g_app.path, MAX_PATH - 1);
+        folder_path[MAX_PATH - 1] = L'\0';
+        {
+            wchar_t *slash = wcsrchr(folder_path, L'\\');
+            if (slash != NULL) {
+                IShellItem *folder = NULL;
+                *slash = L'\0';
+                if (SUCCEEDED(SHCreateItemFromParsingName(
+                        folder_path, NULL, &IID_IShellItem, (void **)&folder))) {
+                    dialog->lpVtbl->SetDefaultFolder(dialog, folder);
+                    fus_release(folder);
                 }
             }
-            y += 44.0f + gap;
         }
-        y += 2.0f;
-        g_app.rotation_header_y = y;
-        y += 28.0f;
+    }
+    if (SUCCEEDED(dialog->lpVtbl->Show(dialog, g_app.hwnd))) {
+        dialog->lpVtbl->GetFileTypeIndex(dialog, &type_index);
+        if (SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &item)) &&
+            SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH,
+                                                  &path)) &&
+            path != NULL) {
+            const wchar_t *ext = extension_for_type(type_index);
+            size_t len = wcslen(path);
+            wcsncpy(out, path, cap - 1);
+            out[cap - 1] = L'\0';
+            if (len < cap - 6) {
+                bool has_ext = false;
+                const wchar_t *dot = wcsrchr(out, L'.');
+                if (dot != NULL && wcslen(dot) <= 5) {
+                    has_ext = (_wcsicmp(dot, L".png") == 0) ||
+                              (_wcsicmp(dot, L".jpg") == 0) ||
+                              (_wcsicmp(dot, L".jpeg") == 0) ||
+                              (_wcsicmp(dot, L".bmp") == 0) ||
+                              (_wcsicmp(dot, L".tif") == 0) ||
+                              (_wcsicmp(dot, L".tiff") == 0);
+                }
+                if (!has_ext) {
+                    wcscat(out, ext);
+                }
+            }
+            ok = true;
+            CoTaskMemFree(path);
+        }
+        fus_release(item);
+    }
+    fus_release(dialog);
+    return ok;
+}
+
+/* -------------------------------------------------------------- crop logic */
+
+static void oriented_dims(const FusApp *app, float *w, float *h) {
+    if ((app->rotation & 1) != 0) {
+        *w = app->img_h;
+        *h = app->img_w;
     } else {
-        g_app.rotation_header_y = y;
-        y += 30.0f;
-    }
-
-    {
-        int cols = g_app.compact ? 1 : 2;
-        int rows = (6 + cols - 1) / cols;
-        float card_w = (cw - gap * (float)(cols - 1)) / (float)cols;
-        float card_h = g_app.compact ? 46.0f : 50.0f;
-        int ids[6] = {CTRL_ROT_L90, CTRL_ROT_R90, CTRL_ROT_L180,
-                      CTRL_ROT_R180, CTRL_FLIP_H, CTRL_FLIP_V};
-        IconKind icons[6] = {ICON_ROTATE_L90, ICON_ROTATE_R90,
-                             ICON_ROTATE_L180, ICON_ROTATE_R180,
-                             ICON_FLIP_H, ICON_FLIP_V};
-        const wchar_t *labels[6] = {L"90°", L"90°", L"180°", L"180°",
-                                    L"水平镜像", L"垂直镜像"};
-        const wchar_t *tips[6] = {L"向左旋转 90°", L"向右旋转 90°",
-                                  L"向左旋转 180°", L"向右旋转 180°",
-                                  L"水平镜像  (H)", L"垂直镜像  (Shift+H)"};
-        g_app.rotation_cards_y = y;
-        for (i = 0; i < 6; ++i) {
-            int col = i % cols;
-            int row = i / cols;
-            Rect r = rect_make(x + (card_w + gap) * (float)col,
-                               y + (card_h + gap) * (float)row,
-                               x + (card_w + gap) * (float)col + card_w,
-                               y + (card_h + gap) * (float)row + card_h);
-            c = add_control(ids[i], r, labels[i], tips[i], icons[i], STYLE_CARD);
-            if (c) {
-                c->scrolled = true;
-                c->enabled = g_app.has_image && !g_app.loading &&
-                             !g_app.crop_mode;
-                if (ids[i] == CTRL_FLIP_H) c->selected = g_app.mirror_h;
-                if (ids[i] == CTRL_FLIP_V) c->selected = g_app.mirror_v;
-                if (i >= 4) c->icon_only = true;
-            }
-        }
-        y += card_h * (float)rows + gap * (float)(rows - 1) + 8.0f;
-    }
-
-    {
-        Rect divider = rect_make(x + 2.0f, y + 10.0f, x + cw - 2.0f, y + 10.0f);
-        g_app.crop_divider_y = rect_cy(divider);
-    }
-    g_app.crop_header_y = y + 22.0f;
-    y = g_app.crop_header_y + 28.0f;
-
-    {
-        int cols = g_app.compact ? 1 : (g_app.wide ? 3 : 2);
-        float card_w = (cw - gap * (float)(cols - 1)) / (float)cols;
-        float card_h = g_app.compact ? 46.0f : 52.0f;
-        g_app.crop_cards_y = y;
-        for (i = 0; i < 8; ++i) {
-            int col = i % cols;
-            int row = i / cols;
-            Rect r = rect_make(x + (card_w + gap) * (float)col,
-                               y + (card_h + gap) * (float)row,
-                               x + (card_w + gap) * (float)col + card_w,
-                               y + (card_h + gap) * (float)row + card_h);
-            c = add_control(CTRL_RATIO_16_9 + i, r, RATIOS[i].label,
-                            RATIOS[i].tooltip, ICON_NONE, STYLE_RATIO);
-            if (c) {
-                c->scrolled = true;
-                c->ratio_index = i;
-                c->aspect = RATIOS[i].aspect;
-                c->selected = g_app.crop_mode && g_app.crop_preset == i;
-                c->enabled = g_app.has_image && !g_app.loading;
-            }
-        }
-        y += card_h * (float)((8 + cols - 1) / cols) + gap *
-                 (float)(((8 + cols - 1) / cols) - 1);
-        y += g_app.compact ? 8.0f : 10.0f;
-    }
-
-    g_app.crop_hint_y = y;
-    y += 12.0f;
-    content_end = y;
-
-    g_app.content_height = content_end - content_start;
-    viewport_h = g_app.tools_bottom - g_app.tools_top;
-    g_app.scroll_max = g_app.content_height - viewport_h;
-    if (g_app.scroll_max < 0.0f) g_app.scroll_max = 0.0f;
-    new_scroll = clampf(g_app.scroll_y, 0.0f, g_app.scroll_max);
-    delta = new_scroll - g_app.scroll_y;
-    g_app.scroll_y = new_scroll;
-    if (delta != 0.0f) {
-        for (i = 0; i < g_app.control_count; ++i) {
-            if (g_app.controls[i].scrolled) {
-                g_app.controls[i].rect.top -= delta;
-                g_app.controls[i].rect.bottom -= delta;
-            }
-        }
-        g_app.rotation_header_y -= delta;
-        g_app.rotation_cards_y -= delta;
-        g_app.crop_header_y -= delta;
-        g_app.crop_divider_y -= delta;
-        g_app.crop_cards_y -= delta;
-        g_app.crop_hint_y -= delta;
-    }
-
-    if (g_app.crop_panel_visible) {
-        float by = g_app.crop_panel_top + (g_app.compact ? 30.0f : 40.0f);
-        float bh = g_app.compact ? 36.0f : 44.0f;
-        if (g_app.compact) {
-            c = add_control(CTRL_APPLY_CROP,
-                            rect_make(x, by, x + cw, by + bh),
-                            L"应用裁剪", L"应用裁剪  (Enter)", ICON_CHECK,
-                            STYLE_PRIMARY);
-            if (c) {
-                c->enabled = g_app.has_image && !g_app.loading;
-                c->icon_only = true;
-            }
-            c = add_control(CTRL_CANCEL_CROP,
-                            rect_make(x, by + bh + 8.0f, x + cw,
-                                      by + bh * 2.0f + 8.0f),
-                            L"取消", L"取消裁剪  (Esc)", ICON_CLOSE,
-                            STYLE_TONAL);
-            if (c) {
-                c->enabled = g_app.has_image && !g_app.loading;
-                c->icon_only = true;
-            }
-        } else {
-            float aw = cw * 0.56f;
-            c = add_control(CTRL_APPLY_CROP,
-                            rect_make(x, by, x + aw, by + bh),
-                            L"应用裁剪", L"应用裁剪  (Enter)", ICON_CHECK,
-                            STYLE_PRIMARY);
-            if (c) {
-                c->enabled = g_app.has_image && !g_app.loading;
-                c->icon_only = true;
-            }
-            c = add_control(CTRL_CANCEL_CROP,
-                            rect_make(x + aw + 8.0f, by, x + cw, by + bh),
-                            L"取消", L"取消裁剪  (Esc)", ICON_CLOSE,
-                            STYLE_TONAL);
-            if (c) {
-                c->enabled = g_app.has_image && !g_app.loading;
-                c->icon_only = true;
-            }
-        }
-    }
-
-    {
-        float fh = g_app.height - g_app.footer_top;
-        float tw = g_app.compact ? 44.0f : 48.0f;
-        float th = 44.0f;
-        g_app.theme_button_y = g_app.footer_top + (fh - th) * 0.5f;
-        c = add_control(CTRL_THEME,
-                        rect_make((g_app.sidebar_w - tw) * 0.5f,
-                                  g_app.theme_button_y,
-                                  (g_app.sidebar_w + tw) * 0.5f,
-                                  g_app.theme_button_y + th),
-                        g_app.dark ? L"浅色外观" : L"深色外观",
-                        L"切换深色 / 浅色外观  (T)",
-                        g_app.dark ? ICON_SUN : ICON_MOON, STYLE_THEME);
-        if (c) c->icon_only = true;
-    }
-    (void)c;
-}
-
-static void rotated_pixel_size(int *out_w, int *out_h) {
-    int w = (int)g_app.image.width;
-    int h = (int)g_app.image.height;
-    if (g_app.rotation == 1 || g_app.rotation == 3) {
-        *out_w = h;
-        *out_h = w;
-    } else {
-        *out_w = w;
-        *out_h = h;
+        *w = app->img_w;
+        *h = app->img_h;
     }
 }
 
-static void crop_display_size(float *out_w, float *out_h) {
-    int rw;
-    int rh;
-    rotated_pixel_size(&rw, &rh);
-    *out_w = (float)rw * (g_app.crop.right - g_app.crop.left);
-    *out_h = (float)rh * (g_app.crop.bottom - g_app.crop.top);
-    if (*out_w < 1.0f) *out_w = 1.0f;
-    if (*out_h < 1.0f) *out_h = 1.0f;
-}
+static void apply_crop_preset(int index) {
+    FusApp *app = &g_app;
+    float ow, oh, ratio;
 
-static void update_image_view(void) {
-    float avail_w;
-    float avail_h;
-    float src_w;
-    float src_h;
-    float fit;
-    float disp_w;
-    float disp_h;
-    float cx;
-    float cy;
-    float slack_x;
-    float slack_y;
-    float limit_x;
-    float limit_y;
-    int rw;
-    int rh;
-
-    if (!g_app.has_image || (!g_app.image_visible && g_app.image.pixels == NULL)) {
-        g_app.image_visible = false;
+    if (!app->has_image || index < 0 || index >= g_preset_count) {
         return;
     }
-    avail_w = rect_w(g_app.canvas) - g_app.view_pad * 2.0f;
-    avail_h = rect_h(g_app.canvas) - g_app.view_pad * 2.0f;
-    if (avail_w < 80.0f) avail_w = 80.0f;
-    if (avail_h < 80.0f) avail_h = 80.0f;
-
-    rotated_pixel_size(&rw, &rh);
-    if (g_app.crop_mode) {
-        src_w = (float)rw;
-        src_h = (float)rh;
-    } else {
-        crop_display_size(&src_w, &src_h);
+    if (!app->cropping) {
+        app->crop_before[0] = app->crop.left;
+        app->crop_before[1] = app->crop.top;
+        app->crop_before[2] = app->crop.right;
+        app->crop_before[3] = app->crop.bottom;
+        app->crop_before_preset = app->crop_preset;
     }
-    fit = fminf(avail_w / src_w, avail_h / src_h);
-    fit = clampf(fit, 0.01f, 4.0f);
-    g_app.fit_scale = fit;
-    g_app.zoom = clampf(g_app.zoom, 0.1f, 16.0f);
-    g_app.display_scale = fit * g_app.zoom;
-    disp_w = src_w * g_app.display_scale;
-    disp_h = src_h * g_app.display_scale;
-
-    slack_x = fmaxf(0.0f, (disp_w - avail_w) * 0.5f);
-    slack_y = fmaxf(0.0f, (disp_h - avail_h) * 0.5f);
-    limit_x = slack_x + fmaxf(36.0f, avail_w * 0.18f);
-    limit_y = slack_y + fmaxf(36.0f, avail_h * 0.18f);
-    g_app.pan.x = clampf(g_app.pan.x, -limit_x, limit_x);
-    g_app.pan.y = clampf(g_app.pan.y, -limit_y, limit_y);
-
-    cx = rect_cx(g_app.canvas) + g_app.pan.x;
-    cy = rect_cy(g_app.canvas) + g_app.pan.y;
-    g_app.image_rect = rect_make(cx - disp_w * 0.5f, cy - disp_h * 0.5f,
-                                 cx + disp_w * 0.5f, cy + disp_h * 0.5f);
-    g_app.image_visible = true;
-}
-
-static void set_fit_view(void) {
-    g_app.zoom = 1.0f;
-    g_app.pan = point_make(0.0f, 0.0f);
-    update_image_view();
-}
-
-static void zoom_view(float factor, float mouse_x, float mouse_y) {
-    float old_scale;
-    float new_zoom;
-    float new_scale;
-    float cx;
-    float cy;
-    float rel_x = 0.0f;
-    float rel_y = 0.0f;
-    float new_cx;
-    float new_cy;
-
-    if (!g_app.has_image) return;
-    if (mouse_x < g_app.canvas.left || mouse_x > g_app.canvas.right ||
-        mouse_y < g_app.canvas.top || mouse_y > g_app.canvas.bottom) {
-        mouse_x = rect_cx(g_app.canvas);
-        mouse_y = rect_cy(g_app.canvas);
-    }
-    old_scale = g_app.display_scale;
-    new_zoom = clampf(g_app.zoom * factor, 0.1f, 16.0f);
-    if (fabsf(new_zoom - g_app.zoom) < 0.0001f) return;
-    if (old_scale > 0.0f) {
-        cx = rect_cx(g_app.canvas) + g_app.pan.x;
-        cy = rect_cy(g_app.canvas) + g_app.pan.y;
-        rel_x = (mouse_x - cx) / old_scale;
-        rel_y = (mouse_y - cy) / old_scale;
-    }
-    g_app.zoom = new_zoom;
-    g_app.display_scale = g_app.fit_scale * g_app.zoom;
-    new_scale = g_app.display_scale;
-    new_cx = mouse_x - rel_x * new_scale;
-    new_cy = mouse_y - rel_y * new_scale;
-    g_app.pan.x = new_cx - rect_cx(g_app.canvas);
-    g_app.pan.y = new_cy - rect_cy(g_app.canvas);
-    update_image_view();
-}
-
-static void draw_keycap(Rect r, const wchar_t *text) {
-    fill_rounded(r, 6.0f, g_app.theme.container);
-    stroke_rounded(r, 6.0f, color_alpha(g_app.theme.outline_variant, 0.8f), 1.0f,
-                   NULL);
-    draw_text_raw(text, g_app.f_tiny, r, g_app.theme.on_surface_variant, 1, 1,
-                  false, true);
-}
-
-static void draw_section_header(float y, IconKind icon, Color accent) {
-    float x = g_app.margin;
-    float cw = g_app.sidebar_w - g_app.margin * 2.0f;
-    draw_icon(icon, rect_make(x, y, x + 20.0f, y + 20.0f), accent);
-    line(x + 28.0f, y + 10.0f, x + cw, y + 10.0f,
-         color_alpha(g_app.theme.outline_variant, 0.7f), 1.0f);
-}
-
-static void draw_aspect_preview(Rect area, float aspect, bool selected,
-                                bool enabled) {
-    float max_w = rect_w(area);
-    float max_h = rect_h(area);
-    float w;
-    float h;
-    Rect r;
-    Color outline = selected ? g_app.theme.primary
-                             : color_alpha(g_app.theme.primary, 0.62f);
-    if (!enabled) {
-        outline = color_alpha(g_app.theme.on_surface_variant, 0.38f);
-    }
-    if (aspect <= 0.0f) {
-        w = fminf(max_w, 28.0f);
-        h = fminf(max_h, 20.0f);
-        r = rect_make(rect_cx(area) - w * 0.5f, rect_cy(area) - h * 0.5f,
-                      rect_cx(area) + w * 0.5f, rect_cy(area) + h * 0.5f);
-        stroke_rounded(r, 4.0f, outline, 1.3f, g_app.dash_style);
-        line(r.left + 4.0f, r.bottom - 4.0f, r.right - 4.0f, r.top + 4.0f,
-             color_alpha(outline, 0.7f), 1.0f);
+    app->crop_preset = index;
+    ratio = g_presets[index].ratio;
+    if (ratio <= 0.0f) {
+        /* free: keep what is on screen, the user drags from there */
+        app->crop_work[0] = app->cropping ? app->crop_work[0] : app->crop.left;
+        app->crop_work[1] = app->cropping ? app->crop_work[1] : app->crop.top;
+        app->crop_work[2] = app->cropping ? app->crop_work[2] : app->crop.right;
+        app->crop_work[3] = app->cropping ? app->crop_work[3] : app->crop.bottom;
+        app->cropping = true;
+        app->crop_grip = 0;
+        ui_invalidate(app);
         return;
     }
-    if (aspect >= max_w / max_h) {
-        w = max_w;
-        h = w / aspect;
-    } else {
-        h = max_h;
-        w = h * aspect;
+    oriented_dims(app, &ow, &oh);
+    {
+        float cw = 1.0f, ch = 1.0f;
+        float image_ratio = ow / oh;
+        if (image_ratio > ratio) {
+            cw = ratio / image_ratio;
+        } else {
+            ch = image_ratio / ratio;
+        }
+        app->crop_work[0] = (1.0f - cw) * 0.5f;
+        app->crop_work[1] = (1.0f - ch) * 0.5f;
+        app->crop_work[2] = app->crop_work[0] + cw;
+        app->crop_work[3] = app->crop_work[1] + ch;
     }
-    w = fmaxf(w, 10.0f);
-    h = fmaxf(h, 10.0f);
-    r = rect_make(rect_cx(area) - w * 0.5f, rect_cy(area) - h * 0.5f,
-                  rect_cx(area) + w * 0.5f, rect_cy(area) + h * 0.5f);
-    if (selected) {
-        fill_rounded(r, 2.5f, color_alpha(g_app.theme.primary, 0.13f));
-    }
-    stroke_rounded(r, 2.5f, outline, selected ? 1.7f : 1.3f, NULL);
+    app->cropping = true;
+    app->crop_grip = 0;
+    ui_invalidate(app);
 }
 
-static void draw_control(LumaControl *c) {
-    LumaTheme *t = &g_app.theme;
-    Color fill;
-    Color border;
-    Color text;
-    Color icon;
-    Color overlay;
-    float radius;
-    bool hover;
-    bool pressed;
-    bool disabled;
-    int align;
+/* ------------------------------------------------------------- interaction */
 
-    if (c == NULL) return;
-    hover = g_app.hover_id == c->id && c->enabled;
-    pressed = hover && g_app.pressed_id == c->id && g_app.mouse_down;
-    disabled = !c->enabled;
-    overlay = color_alpha(t->on_surface, 0.0f);
-    border = color_alpha(t->outline_variant, 0.0f);
-    fill = t->container_lowest;
-    text = t->on_surface;
-    icon = t->primary;
-    radius = 14.0f;
-    align = 0;
-
-    switch (c->style) {
-    case STYLE_PRIMARY:
-        fill = t->primary;
-        text = t->on_primary;
-        icon = t->on_primary;
-        overlay = t->on_primary;
-        radius = c->id == CTRL_OPEN ? 17.0f : 14.0f;
-        break;
-    case STYLE_TONAL:
-        fill = color_alpha(t->container_high, g_app.dark ? 0.6f : 0.55f);
-        border = color_alpha(t->outline_variant, 0.5f);
-        text = t->on_surface;
-        icon = t->primary;
-        overlay = t->on_surface;
-        radius = 14.0f;
-        break;
-    case STYLE_ACTIONS:
-        if (c->selected) {
-            fill = t->primary_container;
-            border = t->primary;
-            text = t->on_primary_container;
-            icon = t->on_primary_container;
-            overlay = t->primary;
-        } else {
-            fill = color_alpha(t->container, g_app.dark ? 0.9f : 0.85f);
-            border = color_alpha(t->outline_variant, 0.42f);
-            text = t->on_surface;
-            icon = t->primary;
-            overlay = t->on_surface;
-        }
-        radius = 13.0f;
-        break;
-    case STYLE_CARD:
-        fill = c->selected ? t->primary_container : t->container_lowest;
-        border = c->selected ? t->primary
-                             : color_alpha(t->outline_variant, 0.62f);
-        text = c->selected ? t->on_primary_container : t->on_surface;
-        icon = c->selected ? t->on_primary_container : t->primary;
-        overlay = c->selected ? t->primary : t->on_surface;
-        radius = 15.0f;
-        break;
-    case STYLE_RATIO:
-        fill = c->selected ? t->primary_container : color_alpha(t->surface, 0.0f);
-        border = c->selected ? t->primary
-                             : color_alpha(t->outline_variant, 0.0f);
-        text = c->selected ? t->on_primary_container : t->on_surface;
-        icon = c->selected ? t->on_primary_container : t->primary;
-        overlay = c->selected ? t->primary : t->on_surface;
-        radius = 14.0f;
-        break;
-    case STYLE_THEME:
-        fill = color_alpha(t->container, g_app.dark ? 0.85f : 0.9f);
-        border = color_alpha(t->outline_variant, 0.48f);
-        text = t->on_surface;
-        icon = t->primary;
-        overlay = t->on_surface;
-        radius = 15.0f;
-        break;
-    }
-
-    if (disabled) {
-        if (c->style != STYLE_RATIO) {
-            fill = color_mix(fill, t->surface, 0.48f);
-        }
-        border = color_alpha(border, 0.35f);
-        text = color_alpha(text, 0.38f);
-        icon = color_alpha(icon, 0.38f);
-    }
-
-    fill_rounded(c->rect, radius, fill);
-    if (border.a > 0.01f) {
-        stroke_rounded(rect_inset(c->rect, 0.5f, 0.5f), radius - 0.5f, border,
-                       c->selected ? 1.6f : 1.0f, NULL);
-    }
-    if (c->enabled && (hover || pressed)) {
-        RoundClip clip = push_round_clip(c->rect, radius);
-        fill_rounded(c->rect, radius,
-                     color_alpha(overlay, pressed ? 0.11f : 0.06f));
-        pop_round_clip(&clip);
-    }
-
-    if (c->style == STYLE_CARD) {
-        if (c->icon_only) {
-            draw_icon(c->icon,
-                      rect_make(rect_cx(c->rect) - 10.0f,
-                                rect_cy(c->rect) - 10.0f,
-                                rect_cx(c->rect) + 10.0f,
-                                rect_cy(c->rect) + 10.0f),
-                      icon);
-        } else if (g_app.compact) {
-            float iy = c->rect.top + 4.0f;
-            draw_icon(c->icon,
-                      rect_make(rect_cx(c->rect) - 9.0f, iy,
-                                rect_cx(c->rect) + 9.0f, iy + 18.0f),
-                      icon);
-            draw_text_raw(c->label, g_app.f_tiny,
-                          rect_make(c->rect.left + 2.0f, c->rect.top + 25.0f,
-                                    c->rect.right - 2.0f, c->rect.bottom - 2.0f),
-                          text, 1, 1, false, true);
-        } else {
-            float icon_size = 22.0f;
-            float gap = 8.0f;
-            float tw = text_width(c->label, g_app.f_label);
-            float start = rect_cx(c->rect) - (icon_size + gap + tw) * 0.5f;
-            draw_icon(c->icon,
-                      rect_make(start, rect_cy(c->rect) - 11.0f,
-                                start + icon_size, rect_cy(c->rect) + 11.0f),
-                      icon);
-            draw_text_raw(c->label, g_app.f_label,
-                          rect_make(start + icon_size + gap, c->rect.top + 4.0f,
-                                    start + icon_size + gap + tw + 2.0f,
-                                    c->rect.bottom - 4.0f),
-                          text, 0, 1, false, true);
-        }
-    } else if (c->style == STYLE_RATIO) {
-        Rect preview;
-        Rect label;
-        if (g_app.compact) {
-            preview = rect_make(c->rect.left + 5.0f, c->rect.top + 5.0f,
-                                c->rect.right - 5.0f, c->rect.top + 26.0f);
-            label = rect_make(c->rect.left + 2.0f, c->rect.top + 26.0f,
-                              c->rect.right - 2.0f, c->rect.bottom - 2.0f);
-        } else {
-            preview = rect_make(c->rect.left + 8.0f, c->rect.top + 7.0f,
-                                c->rect.right - 8.0f, c->rect.top + 38.0f);
-            label = rect_make(c->rect.left + 2.0f, c->rect.top + 38.0f,
-                              c->rect.right - 2.0f, c->rect.bottom - 2.0f);
-        }
-        draw_aspect_preview(preview, c->aspect, c->selected, c->enabled);
-        draw_text_raw(c->label, g_app.compact ? g_app.f_tiny : g_app.f_caption,
-                      label, text, 1, 1, false, true);
-        if (c->selected) {
-            Rect badge = rect_make(c->rect.right - 17.0f, c->rect.top + 5.0f,
-                                   c->rect.right - 5.0f, c->rect.top + 17.0f);
-            fill_ellipse(rect_cx(badge), rect_cy(badge), 6.0f, 6.0f, t->primary);
-            draw_icon(ICON_CHECK,
-                      rect_make(rect_cx(badge) - 4.0f, rect_cy(badge) - 4.0f,
-                                rect_cx(badge) + 4.0f, rect_cy(badge) + 4.0f),
-                      t->on_primary);
-        }
-    } else {
-        bool icon_only = c->icon_only || c->style == STYLE_ACTIONS ||
-                         (g_app.compact &&
-                          (c->style == STYLE_PRIMARY ||
-                           c->style == STYLE_TONAL));
-        if (icon_only && c->id == CTRL_OPEN && !g_app.compact) {
-            float icon_box = 22.0f;
-            float icon_left = c->rect.left + 17.0f;
-            float bw = text_width(L"Ctrl O", g_app.f_tiny) + 14.0f;
-            Rect badge_rect = rect_make(c->rect.right - bw - 12.0f,
-                                        rect_cy(c->rect) - 11.0f,
-                                        c->rect.right - 12.0f,
-                                        rect_cy(c->rect) + 11.0f);
-            draw_icon(c->icon,
-                      rect_make(icon_left, rect_cy(c->rect) - icon_box * 0.5f,
-                                icon_left + icon_box,
-                                rect_cy(c->rect) + icon_box * 0.5f),
-                      icon);
-            fill_rounded(badge_rect, 7.0f,
-                         color_alpha(t->on_primary, 0.14f));
-            draw_text_raw(L"Ctrl O", g_app.f_tiny, badge_rect,
-                          color_alpha(t->on_primary, 0.95f), 1, 1, false, true);
-        } else if (icon_only) {
-            float icon_box = c->style == STYLE_PRIMARY ? 22.0f : 20.0f;
-            draw_icon(c->icon,
-                      rect_make(rect_cx(c->rect) - icon_box * 0.5f,
-                                rect_cy(c->rect) - icon_box * 0.5f,
-                                rect_cx(c->rect) + icon_box * 0.5f,
-                                rect_cy(c->rect) + icon_box * 0.5f),
-                      icon);
-        } else {
-            float icon_box = c->style == STYLE_PRIMARY && c->id == CTRL_OPEN
-                                 ? 22.0f
-                                 : 20.0f;
-            float icon_left = c->rect.left + 14.0f;
-            float label_left = icon_left + icon_box + 11.0f;
-            float label_right = c->rect.right - 12.0f;
-            draw_icon(c->icon,
-                      rect_make(icon_left, rect_cy(c->rect) - icon_box * 0.5f,
-                                icon_left + icon_box,
-                                rect_cy(c->rect) + icon_box * 0.5f),
-                      icon);
-            draw_text_raw(c->label,
-                          c->style == STYLE_PRIMARY ? g_app.f_button
-                                                    : g_app.f_label,
-                          rect_make(label_left, c->rect.top + 4.0f, label_right,
-                                    c->rect.bottom - 4.0f),
-                          text, align, 1, false, true);
-        }
-    }
-
-    if (g_app.focus_visible && g_app.focus_id == c->id && c->enabled) {
-        stroke_rounded(rect_inset(c->rect, -2.0f, -2.0f), radius + 2.0f,
-                       g_app.theme.primary, 2.0f, NULL);
-    }
-}
-
-static void draw_scrollbar(void) {
-    float track_top;
-    float track_bottom;
-    float viewport;
-    float thumb_h;
-    float thumb_y;
-    float ratio;
-    if (g_app.scroll_max <= 0.5f) return;
-    track_top = g_app.tools_top + 8.0f;
-    track_bottom = g_app.tools_bottom - 8.0f;
-    viewport = track_bottom - track_top;
-    if (viewport < 20.0f) return;
-    thumb_h = viewport * viewport / g_app.content_height;
-    thumb_h = clampf(thumb_h, 34.0f, viewport);
-    ratio = g_app.scroll_y / g_app.scroll_max;
-    thumb_y = track_top + (viewport - thumb_h) * ratio;
-    fill_rounded(rect_make(g_app.sidebar_w - 6.0f, track_top,
-                           g_app.sidebar_w - 3.0f, track_bottom),
-                 1.5f, color_alpha(g_app.theme.on_surface, 0.06f));
-    fill_rounded(rect_make(g_app.sidebar_w - 6.0f, thumb_y,
-                           g_app.sidebar_w - 3.0f, thumb_y + thumb_h),
-                 1.5f, color_alpha(g_app.theme.on_surface, 0.22f));
-}
-
-static void paint_brand(void) {
-    LumaTheme *t = &g_app.theme;
-    Rect tile;
-    if (g_app.compact) {
-        tile = rect_make((g_app.sidebar_w - 40.0f) * 0.5f, 18.0f,
-                         (g_app.sidebar_w + 40.0f) * 0.5f, 58.0f);
-        draw_logo_mark(tile);
+static void rotate_by(int quarters) {
+    FusApp *app = &g_app;
+    if (!app->has_image) {
         return;
     }
-    tile = rect_make(g_app.margin, 18.0f, g_app.margin + 40.0f, 58.0f);
-    draw_logo_mark(tile);
-    draw_text_raw(L"Fustimage", g_app.f_brand,
-                  rect_make(tile.right + 12.0f, 17.0f,
-                            g_app.sidebar_w - g_app.margin, 55.0f),
-                  t->on_surface, 0, 1, false, true);
+    app->rotation = (app->rotation + quarters) & 3;
+    /* Crop rectangles do not survive a 90 degree turn, so start over. */
+    app->crop.left = 0.0f;
+    app->crop.top = 0.0f;
+    app->crop.right = 1.0f;
+    app->crop.bottom = 1.0f;
+    app->crop_preset = 0;
+    app->cropping = false;
+    history_commit(app);
+    ui_invalidate(app);
 }
 
-static void paint_crop_panel_title(void) {
-    LumaTheme *t = &g_app.theme;
-    const wchar_t *ratio = (g_app.crop_preset >= 0 &&
-                            g_app.crop_preset < 8)
-                               ? RATIOS[g_app.crop_preset].label
-                               : L"∞";
-    float x = g_app.margin;
-    float cw = g_app.sidebar_w - g_app.margin * 2.0f;
-    Color pill_bg = color_alpha(t->primary_container,
-                                g_app.dark ? 0.75f : 0.9f);
-    Color pill_text = t->on_primary_container;
-    float tw = text_width(ratio, g_app.f_tiny) + 14.0f;
-    float y = g_app.crop_panel_top + (g_app.compact ? 8.0f : 12.0f);
-    Rect pill;
-
-    draw_icon(ICON_CROP, rect_make(x, y + (g_app.compact ? 1.0f : 2.0f),
-                                   x + 18.0f,
-                                   y + (g_app.compact ? 19.0f : 20.0f)),
-              t->primary);
-    pill = rect_make(x + cw - tw, y, x + cw,
-                     y + (g_app.compact ? 18.0f : 22.0f));
-    fill_rounded(pill, g_app.compact ? 9.0f : 11.0f, pill_bg);
-    draw_text_raw(ratio, g_app.f_tiny, pill, pill_text, 1, 1, false, true);
-}
-
-static void paint_footer(void) {
-    LumaTheme *t = &g_app.theme;
-    Rect bg = rect_make(0.0f, g_app.footer_top, g_app.sidebar_w, g_app.height);
-    fill_rect(bg, color_mix(t->container_low, t->container, 0.55f));
-    line(0.0f, g_app.footer_top + 0.5f, g_app.sidebar_w,
-         g_app.footer_top + 0.5f, color_alpha(t->outline_variant, 0.55f), 1.0f);
-}
-
-static void paint_sidebar(void) {
-    LumaTheme *t = &g_app.theme;
-    Rect clip;
-    int i;
-    LumaControl *open;
-    LumaControl *apply;
-    LumaControl *cancel;
-    LumaControl *theme;
-    LumaControl *undo;
-    LumaControl *redo;
-    LumaControl *exportc;
-    LumaControl *copy;
-
-    fill_rect(g_app.sidebar, t->container_low);
-
-    paint_brand();
-
-    open = find_control(CTRL_OPEN);
-    if (open) draw_control(open);
-
-    undo = find_control(CTRL_UNDO);
-    redo = find_control(CTRL_REDO);
-    exportc = find_control(CTRL_EXPORT);
-    copy = find_control(CTRL_COPY);
-    if (!g_app.compact) {
-        if (undo) draw_control(undo);
-        if (redo) draw_control(redo);
-        if (exportc) draw_control(exportc);
-        if (copy) draw_control(copy);
+static void flip_axis(bool horizontal) {
+    FusApp *app = &g_app;
+    if (!app->has_image) {
+        return;
     }
-
-    if (g_app.crop_panel_visible) {
-        Rect panel = rect_make(0.0f, g_app.crop_panel_top, g_app.sidebar_w,
-                               g_app.footer_top);
-        fill_rect(panel, color_mix(t->container_low, t->container_high, 0.35f));
-        line(0.0f, g_app.crop_panel_top + 0.5f, g_app.sidebar_w,
-             g_app.crop_panel_top + 0.5f,
-             color_alpha(t->outline_variant, 0.65f), 1.0f);
-        paint_crop_panel_title();
+    if (horizontal) {
+        app->mirror_h = !app->mirror_h;
+    } else {
+        app->mirror_v = !app->mirror_v;
     }
+    app->crop.left = 0.0f;
+    app->crop.top = 0.0f;
+    app->crop.right = 1.0f;
+    app->crop.bottom = 1.0f;
+    app->crop_preset = 0;
+    app->cropping = false;
+    history_commit(app);
+    ui_invalidate(app);
+}
 
-    paint_footer();
+static void toggle_filter(bool grayscale) {
+    FusApp *app = &g_app;
+    if (!app->has_image) {
+        return;
+    }
+    if (grayscale) {
+        app->grayscale = !app->grayscale;
+    } else {
+        app->invert = !app->invert;
+    }
+    history_commit(app);
+    start_filter();
+    ui_invalidate(app);
+}
 
-    clip = rect_make(0.0f, g_app.tools_top, g_app.sidebar_w, g_app.tools_bottom);
-    if (clip.bottom > clip.top) {
-        g_app.rt->lpVtbl->PushAxisAlignedClip(g_app.rt, &clip,
-                                              D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        draw_section_header(g_app.rotation_header_y, ICON_ROTATE_R90, t->primary);
-        line(g_app.margin + 2.0f, g_app.crop_divider_y,
-             g_app.sidebar_w - g_app.margin - 2.0f,
-             g_app.crop_divider_y,
-             color_alpha(t->outline_variant, 0.9f), 1.0f);
-        draw_section_header(g_app.crop_header_y, ICON_CROP, t->tertiary);
-        for (i = 0; i < g_app.control_count; ++i) {
-            if (g_app.controls[i].scrolled) draw_control(&g_app.controls[i]);
+static void zoom_at(float sx, float sy, float factor) {
+    FusApp *app = &g_app;
+    float ix, iy, nsx, nsy, zoom;
+
+    if (!app->has_image || !ui_screen_to_image(app, sx, sy, &ix, &iy)) {
+        return;
+    }
+    zoom = ui_effective_zoom(app) * factor;
+    if (zoom < 0.05f) zoom = 0.05f;
+    if (zoom > 8.0f) zoom = 8.0f;
+    app->fit = false;
+    app->zoom = zoom;
+    image_to_screen(app, ix, iy, &nsx, &nsy);
+    app->pan_x += sx - nsx;
+    app->pan_y += sy - nsy;
+    ui_invalidate(app);
+}
+
+static bool canvas_contains(const FusApp *app, float x, float y) {
+    return x >= app->canvas.left && x < app->canvas.right && y >= app->canvas.top &&
+           y < app->canvas.bottom;
+}
+
+/* Oriented normalized point (0..1 across the rotated image) under the cursor. */
+static bool screen_to_oriented(FusApp *app, float sx, float sy, float *nx,
+                               float *ny) {
+    D2D1_MATRIX_3X2_F m = ui_oriented_matrix(app);
+    float ow, oh;
+    oriented_dims(app, &ow, &oh);
+    if (ow <= 0.0f || oh <= 0.0f || fabsf(m._11) < 1e-6f ||
+        fabsf(m._22) < 1e-6f) {
+        return false;
+    }
+    *nx = ((sx - m._31) / m._11) / ow;
+    *ny = ((sy - m._32) / m._22) / oh;
+    return true;
+}
+
+static void oriented_to_screen(FusApp *app, float nx, float ny, float *sx,
+                               float *sy) {
+    D2D1_MATRIX_3X2_F m = ui_oriented_matrix(app);
+    float ow, oh;
+    oriented_dims(app, &ow, &oh);
+    *sx = m._11 * (nx * ow) + m._31;
+    *sy = m._22 * (ny * oh) + m._32;
+}
+
+/* Which part of the pending crop rectangle is under the cursor: 0 nothing,
+   1 inside (move), 2/3 left/right, 4/5 top/bottom, 6..9 corners. */
+static int crop_grip_at(FusApp *app, float x, float y) {
+    float l, t, r, b;
+    float tol = 14.0f;
+    bool near_l, near_r, near_t, near_b, inside_x, inside_y;
+
+    oriented_to_screen(app, app->crop_work[0], app->crop_work[1], &l, &t);
+    oriented_to_screen(app, app->crop_work[2], app->crop_work[3], &r, &b);
+    near_l = fabsf(x - l) <= tol;
+    near_r = fabsf(x - r) <= tol;
+    near_t = fabsf(y - t) <= tol;
+    near_b = fabsf(y - b) <= tol;
+    inside_x = x >= l - tol && x <= r + tol;
+    inside_y = y >= t - tol && y <= b + tol;
+
+    if (near_l && near_t) return 6;
+    if (near_r && near_t) return 7;
+    if (near_l && near_b) return 8;
+    if (near_r && near_b) return 9;
+    if (near_l && inside_y) return 2;
+    if (near_r && inside_y) return 3;
+    if (near_t && inside_x) return 4;
+    if (near_b && inside_x) return 5;
+    if (x > l && x < r && y > t && y < b) return 1;
+    return 0;
+}
+
+/* Pull the dragged rectangle back to the locked ratio, anchored on the corner
+   or edge that is not moving. */
+static void crop_lock_ratio(FusApp *app, float *l, float *t, float *r,
+                            float *b) {
+    float ow, oh, target, pw, ph, cur;
+    int grip = app->crop_grip;
+    bool right_fixed = (grip == 2 || grip == 6 || grip == 8);
+    bool bottom_fixed = (grip == 4 || grip == 6 || grip == 7);
+
+    if (app->crop_preset <= 0 || app->crop_preset >= g_preset_count) {
+        return;
+    }
+    target = g_presets[app->crop_preset].ratio;
+    if (target <= 0.0f) {
+        return;
+    }
+    oriented_dims(app, &ow, &oh);
+    if (ow <= 0.0f || oh <= 0.0f) {
+        return;
+    }
+    pw = (*r - *l) * ow;
+    ph = (*b - *t) * oh;
+    if (ph <= 0.0f) {
+        return;
+    }
+    cur = pw / ph;
+    if (cur > target) {
+        float w = (ph * target) / ow;
+        if (right_fixed) {
+            *l = *r - w;
+        } else {
+            *r = *l + w;
         }
-        g_app.rt->lpVtbl->PopAxisAlignedClip(g_app.rt);
-    }
-
-    draw_scrollbar();
-
-    if (g_app.crop_panel_visible) {
-        apply = find_control(CTRL_APPLY_CROP);
-        cancel = find_control(CTRL_CANCEL_CROP);
-        if (apply) draw_control(apply);
-        if (cancel) draw_control(cancel);
-    }
-    theme = find_control(CTRL_THEME);
-    if (theme) draw_control(theme);
-
-    line(g_app.sidebar_w - 0.5f, 0.0f, g_app.sidebar_w - 0.5f,
-         g_app.height, color_alpha(t->outline_variant, 0.7f), 1.0f);
-}
-
-static void draw_status_pill(Rect r, IconKind icon, Color bg, Color fg) {
-    fill_rounded(r, 13.0f, bg);
-    draw_icon(icon, rect_make(rect_cx(r) - 7.0f, rect_cy(r) - 7.0f,
-                              rect_cx(r) + 7.0f, rect_cy(r) + 7.0f),
-              fg);
-}
-
-static void paint_appbar(void) {
-    LumaTheme *t = &g_app.theme;
-    wchar_t subtitle[256];
-    wchar_t title[200];
-    IconKind status_icon;
-    Color status_bg;
-    Color status_fg;
-    float status_w;
-    Rect status;
-    Rect tile;
-    float text_left;
-
-    fill_rect(g_app.appbar, t->surface);
-    line(g_app.appbar.left, g_app.appbar.bottom - 0.5f, g_app.appbar.right,
-         g_app.appbar.bottom - 0.5f, color_alpha(t->outline_variant, 0.6f),
-         1.0f);
-
-    tile = rect_make(g_app.appbar.left + (g_app.compact ? 18.0f : 24.0f),
-                     17.0f,
-                     g_app.appbar.left + (g_app.compact ? 56.0f : 62.0f), 55.0f);
-    fill_rounded(tile, 12.0f,
-                 color_alpha(t->primary_container, g_app.dark ? 0.8f : 1.0f));
-    draw_icon(ICON_IMAGE,
-              rect_make(rect_cx(tile) - 11.0f, rect_cy(tile) - 11.0f,
-                        rect_cx(tile) + 11.0f, rect_cy(tile) + 11.0f),
-              t->on_primary_container);
-
-    if (g_app.loading && !g_app.has_image) {
-        copy_utf16(title, 200, g_app.loading_name[0] ? g_app.loading_name
-                                                     : L"Fustimage");
-    } else if (g_app.has_image) {
-        copy_utf16(title, 200, g_app.display_name[0] ? g_app.display_name
-                                                     : L"Fustimage");
     } else {
-        title[0] = L'\0';
+        float h = (pw / target) / oh;
+        if (bottom_fixed) {
+            *t = *b - h;
+        } else {
+            *b = *t + h;
+        }
     }
+}
 
-    if (g_app.has_image) {
-        swprintf(subtitle, 256, L"%ls  ·  %ls  ·  %u × %u",
-                 g_app.format_name[0] ? g_app.format_name : L"",
-                 g_app.size_text[0] ? g_app.size_text : L"",
-                 g_app.image.width, g_app.image.height);
+static void crop_begin(FusApp *app, float x, float y) {
+    int grip = crop_grip_at(app, x, y);
+    if (grip == 0) {
+        /* outside the frame: start a brand new rectangle from the press point */
+        if (!screen_to_oriented(app, x, y, &app->drag_ax, &app->drag_ay)) {
+            return;
+        }
+        app->crop_grip = 10;
+        app->drag_rect[0] = app->drag_rect[2] = app->drag_ax;
+        app->drag_rect[1] = app->drag_rect[3] = app->drag_ay;
+        app->crop_work[0] = app->drag_ax;
+        app->crop_work[1] = app->drag_ay;
+        app->crop_work[2] = app->drag_ax;
+        app->crop_work[3] = app->drag_ay;
     } else {
-        subtitle[0] = L'\0';
+        if (!screen_to_oriented(app, x, y, &app->drag_ax, &app->drag_ay)) {
+            return;
+        }
+        app->crop_grip = grip;
+        app->drag_rect[0] = app->crop_work[0];
+        app->drag_rect[1] = app->crop_work[1];
+        app->drag_rect[2] = app->crop_work[2];
+        app->drag_rect[3] = app->crop_work[3];
     }
+    app->panning = true; /* reuse as the crop-drag flag */
+    ui_invalidate(app);
+}
 
-    if (g_app.crop_mode) {
-        status_icon = ICON_CROP;
-        status_bg = color_alpha(t->tertiary_container, g_app.dark ? 0.9f : 1.0f);
-        status_fg = t->on_tertiary_container;
-    } else if (g_app.loading) {
-        status_icon = ICON_SPARKLE;
-        status_bg = t->container_high;
-        status_fg = t->primary;
-    } else if (!g_app.has_image) {
-        status_icon = ICON_OPEN;
-        status_bg = color_alpha(t->container, 0.9f);
-        status_fg = t->on_surface_variant;
-    } else if (g_app.exported) {
-        status_icon = ICON_CHECK;
-        status_bg = color_alpha(t->secondary_container, g_app.dark ? 0.85f : 1.0f);
-        status_fg = t->on_secondary_container;
-    } else if (g_app.edited) {
-        status_icon = ICON_EXPORT;
-        status_bg = color_alpha(t->tertiary_container, g_app.dark ? 0.85f : 1.0f);
-        status_fg = t->on_tertiary_container;
+static void crop_update(FusApp *app, float x, float y) {
+    float nx, ny, dx, dy, l, t, r, b;
+
+    if (!screen_to_oriented(app, x, y, &nx, &ny)) {
+        return;
+    }
+    dx = nx - app->drag_ax;
+    dy = ny - app->drag_ay;
+
+    l = app->drag_rect[0];
+    t = app->drag_rect[1];
+    r = app->drag_rect[2];
+    b = app->drag_rect[3];
+
+    if (app->crop_grip == 10) {
+        /* drawing a fresh rectangle */
+        float nl = nx < app->drag_ax ? nx : app->drag_ax;
+        float nt = ny < app->drag_ay ? ny : app->drag_ay;
+        float nr = nx < app->drag_ax ? app->drag_ax : nx;
+        float nb = ny < app->drag_ay ? app->drag_ay : ny;
+        if (nl < 0.0f) nl = 0.0f;
+        if (nt < 0.0f) nt = 0.0f;
+        if (nr > 1.0f) nr = 1.0f;
+        if (nb > 1.0f) nb = 1.0f;
+        app->crop_work[0] = nl;
+        app->crop_work[1] = nt;
+        app->crop_work[2] = nr;
+        app->crop_work[3] = nb;
+    } else if (app->crop_grip == 1) {
+        float w = r - l, h = b - t;
+        l += dx;
+        r += dx;
+        t += dy;
+        b += dy;
+        if (l < 0.0f) { r -= l; l = 0.0f; }
+        if (t < 0.0f) { b -= t; t = 0.0f; }
+        if (r > 1.0f) { l -= r - 1.0f; r = 1.0f; }
+        if (b > 1.0f) { t -= b - 1.0f; b = 1.0f; }
+        if (r - l < w) { r = l + w; }
+        if (b - t < h) { b = t + h; }
+        app->crop_work[0] = l;
+        app->crop_work[1] = t;
+        app->crop_work[2] = r;
+        app->crop_work[3] = b;
     } else {
-        status_icon = ICON_IMAGE;
-        status_bg = color_alpha(t->container, 0.95f);
-        status_fg = t->on_surface_variant;
+        if (app->crop_grip == 2 || app->crop_grip == 6 || app->crop_grip == 8) {
+            l += dx;
+        }
+        if (app->crop_grip == 3 || app->crop_grip == 7 || app->crop_grip == 9) {
+            r += dx;
+        }
+        if (app->crop_grip == 4 || app->crop_grip == 6 || app->crop_grip == 7) {
+            t += dy;
+        }
+        if (app->crop_grip == 5 || app->crop_grip == 8 || app->crop_grip == 9) {
+            b += dy;
+        }
+        if (l < 0.0f) l = 0.0f;
+        if (t < 0.0f) t = 0.0f;
+        if (r > 1.0f) r = 1.0f;
+        if (b > 1.0f) b = 1.0f;
+        if (r - l < 0.02f) r = l + 0.02f;
+        if (b - t < 0.02f) b = t + 0.02f;
+        crop_lock_ratio(app, &l, &t, &r, &b);
+        if (l < 0.0f) l = 0.0f;
+        if (t < 0.0f) t = 0.0f;
+        if (r > 1.0f) r = 1.0f;
+        if (b > 1.0f) b = 1.0f;
+        app->crop_work[0] = l;
+        app->crop_work[1] = t;
+        app->crop_work[2] = r;
+        app->crop_work[3] = b;
     }
-    status_w = 38.0f;
-    status = rect_make(g_app.appbar.right - (g_app.compact ? 16.0f : 24.0f) -
-                           status_w,
-                       rect_cy(g_app.appbar) - 14.0f,
-                       g_app.appbar.right - (g_app.compact ? 16.0f : 24.0f),
-                       rect_cy(g_app.appbar) + 14.0f);
-    draw_status_pill(status, status_icon, status_bg, status_fg);
-
-    text_left = tile.right + 14.0f;
-    draw_text_trimmed(title, g_app.f_title,
-                      rect_make(text_left, 13.0f, status.left - 14.0f, 37.0f),
-                      t->on_surface, false);
-    draw_text_trimmed(subtitle, g_app.f_caption,
-                      rect_make(text_left, 39.0f, status.left - 14.0f, 56.0f),
-                      t->on_surface_variant, false);
+    ui_invalidate(app);
 }
 
-static D2D1_MATRIX_3X2_F luma_identity_matrix(void) {
-    D2D1_MATRIX_3X2_F m;
-    memset(&m, 0, sizeof(m));
-    m._11 = 1.0f;
-    m._22 = 1.0f;
-    return m;
+static void crop_cancel(FusApp *app) {
+    app->crop.left = app->crop_before[0];
+    app->crop.top = app->crop_before[1];
+    app->crop.right = app->crop_before[2];
+    app->crop.bottom = app->crop_before[3];
+    app->crop_preset = app->crop_before_preset;
+    app->cropping = false;
+    app->crop_grip = 0;
+    app->panning = false;
+    ui_invalidate(app);
 }
 
-static D2D1_MATRIX_3X2_F luma_matrix_mul(D2D1_MATRIX_3X2_F a,
-                                         D2D1_MATRIX_3X2_F b) {
-    D2D1_MATRIX_3X2_F r;
-    r._11 = a._11 * b._11 + a._12 * b._21;
-    r._12 = a._11 * b._12 + a._12 * b._22;
-    r._21 = a._21 * b._11 + a._22 * b._21;
-    r._22 = a._21 * b._12 + a._22 * b._22;
-    r._31 = a._31 * b._11 + a._32 * b._21 + b._31;
-    r._32 = a._31 * b._12 + a._32 * b._22 + b._32;
-    return r;
+static void crop_commit(FusApp *app) {
+    if ((app->crop_work[2] - app->crop_work[0]) < 0.02f ||
+        (app->crop_work[3] - app->crop_work[1]) < 0.02f) {
+        crop_cancel(app);
+        return;
+    }
+    app->crop.left = app->crop_work[0];
+    app->crop.top = app->crop_work[1];
+    app->crop.right = app->crop_work[2];
+    app->crop.bottom = app->crop_work[3];
+    app->cropping = false;
+    app->crop_grip = 0;
+    app->panning = false;
+    history_commit(app);
+    ui_invalidate(app);
+}
+/* --------------------------------------------------------------- commands */
+
+/* Put the document back into a recorded state.  Filters live in the bitmap,
+   so flipping them needs another decode pass. */
+static void apply_state(FusApp *app, const FusDocState *s) {
+    bool refilter = app->grayscale != s->grayscale || app->invert != s->invert;
+
+    app->rotation = s->rotation;
+    app->mirror_h = s->mirror_h;
+    app->mirror_v = s->mirror_v;
+    app->crop = s->crop;
+    app->crop_preset = s->crop_preset;
+    app->cropping = false;
+    app->grayscale = s->grayscale;
+    app->invert = s->invert;
+    if (refilter) {
+        start_filter();
+    }
+    ui_invalidate(app);
 }
 
-static void draw_photo(void) {
-    LumaTheme *t = &g_app.theme;
-    D2D1_MATRIX_3X2_F m;
-    D2D1_MATRIX_3X2_F identity;
-    D2D1_RECT_F dest;
-    D2D1_RECT_F border;
-    int rw;
-    int rh;
-    float s;
-    float shown_l;
-    float shown_t;
-    float ox;
-    float oy;
-    float bw;
-    float bh;
-    RoundClip clip;
+void app_action(int action) {
+    FusApp *app = &g_app;
 
-    if (!g_app.has_image || g_app.bitmap == NULL) return;
-    rotated_pixel_size(&rw, &rh);
-    s = g_app.display_scale;
-    shown_l = g_app.crop_mode ? 0.0f : g_app.crop.left;
-    shown_t = g_app.crop_mode ? 0.0f : g_app.crop.top;
-    ox = g_app.image_rect.left - shown_l * (float)rw * s;
-    oy = g_app.image_rect.top - shown_t * (float)rh * s;
-    bw = (float)g_app.image.width;
-    bh = (float)g_app.image.height;
-
-    memset(&m, 0, sizeof(m));
-    switch (g_app.rotation) {
-    case 1:
-        m._11 = 0.0f;
-        m._12 = s;
-        m._21 = -s;
-        m._22 = 0.0f;
-        m._31 = ox + bh * s;
-        m._32 = oy;
+    switch (action) {
+    case ACT_OPEN:
+    case ACT_CANVAS: {
+        wchar_t path[MAX_PATH];
+        if (action == ACT_CANVAS && app->has_image) {
+            break;
+        }
+        if (pick_open(path, MAX_PATH)) {
+            start_load(path);
+        }
         break;
-    case 2:
-        m._11 = -s;
-        m._12 = 0.0f;
-        m._21 = 0.0f;
-        m._22 = -s;
-        m._31 = ox + bw * s;
-        m._32 = oy + bh * s;
+    }
+    case ACT_SAVE: {
+        wchar_t path[MAX_PATH];
+        if (!app->has_image || app->exporting) {
+            break;
+        }
+        if (pick_save(path, MAX_PATH)) {
+            start_export(path);
+        }
         break;
-    case 3:
-        m._11 = 0.0f;
-        m._12 = -s;
-        m._21 = s;
-        m._22 = 0.0f;
-        m._31 = ox;
-        m._32 = oy + bw * s;
+    }
+    case ACT_SAVE_NEAR: {
+        if (!app->has_image || app->exporting) {
+            break;
+        }
+        if (app->path[0] != L'\0') {
+            wchar_t out[MAX_PATH];
+            const wchar_t *dot = wcsrchr(app->path, L'.');
+            const wchar_t *slash = wcsrchr(app->path, L'\\');
+            size_t base = (size_t)((dot != NULL && (slash == NULL || dot > slash))
+                                       ? (dot - app->path)
+                                       : (int)wcslen(app->path));
+            const wchar_t *ext = (dot != NULL && (slash == NULL || dot > slash))
+                                     ? dot
+                                     : L".png";
+            _snwprintf(out, MAX_PATH, L"%.*s-edited%s", (int)base, app->path,
+                       ext);
+            start_export(out);
+        }
+        break;
+    }
+    case ACT_THEME:
+        toggle_theme();
+        break;
+    case ACT_UNDO:
+        if (app->undo_pos > 0) {
+            app->undo_pos--;
+            apply_state(app, &app->undo[app->undo_pos]);
+        }
+        break;
+    case ACT_REDO:
+        if (app->undo_pos + 1 < app->undo_len) {
+            app->undo_pos++;
+            apply_state(app, &app->undo[app->undo_pos]);
+        }
+        break;
+    case ACT_ROTATE_CW:
+    case ACT_ROTATE_180_CW:
+        rotate_by(action == ACT_ROTATE_CW ? 1 : 2);
+        break;
+    case ACT_ROTATE_CCW:
+    case ACT_ROTATE_180_CCW:
+        rotate_by(action == ACT_ROTATE_CCW ? 3 : 2);
+        break;
+    case ACT_FLIP_H:
+        flip_axis(true);
+        break;
+    case ACT_FLIP_V:
+        flip_axis(false);
+        break;
+    case ACT_GRAYSCALE:
+        toggle_filter(true);
+        break;
+    case ACT_INVERT:
+        toggle_filter(false);
+        break;
+    case ACT_CROP_FREE:
+        if (!app->has_image) {
+            break;
+        }
+        app->cropping = true;
+        app->crop_preset = 0;
+        app->crop_work[0] = app->crop.left;
+        app->crop_work[1] = app->crop.top;
+        app->crop_work[2] = app->crop.right;
+        app->crop_work[3] = app->crop.bottom;
+        ui_invalidate(app);
+        break;
+    case ACT_CROP_16_9:
+        apply_crop_preset(1);
+        break;
+    case ACT_CROP_1_1:
+        apply_crop_preset(2);
+        break;
+    case ACT_CROP_9_16:
+        apply_crop_preset(3);
+        break;
+    case ACT_CROP_4_3:
+        apply_crop_preset(4);
+        break;
+    case ACT_CROP_3_4:
+        apply_crop_preset(5);
+        break;
+    case ACT_CROP_3_2:
+        apply_crop_preset(6);
+        break;
+    case ACT_CROP_2_3:
+        apply_crop_preset(7);
+        break;
+    case ACT_CROP_APPLY:
+        crop_commit(app);
+        break;
+    case ACT_CROP_CANCEL:
+        crop_cancel(app);
+        break;
+    case ACT_ZOOM_FIT:
+        app->fit = true;
+        app->pan_x = 0.0f;
+        app->pan_y = 0.0f;
+        ui_invalidate(app);
+        break;
+    case ACT_ZOOM_100:
+        if (app->has_image) {
+            app->fit = false;
+            app->zoom = 1.0f;
+            app->pan_x = 0.0f;
+            app->pan_y = 0.0f;
+            ui_invalidate(app);
+        }
+        break;
+    case ACT_TOOLS:
+        if (app->pane_w == 0.0f) {
+            app->sheet_open = !app->sheet_open;
+            app->sheet_start_ms = now64();
+            ui_invalidate(app);
+            ensure_timer(app);
+        }
         break;
     default:
-        m._11 = s;
-        m._12 = 0.0f;
-        m._21 = 0.0f;
-        m._22 = s;
-        m._31 = ox;
-        m._32 = oy;
         break;
     }
-
-    if (g_app.mirror_h || g_app.mirror_v) {
-        D2D1_MATRIX_3X2_F flip;
-        float full_cx = ox + (float)rw * s * 0.5f;
-        float full_cy = oy + (float)rh * s * 0.5f;
-        flip._11 = g_app.mirror_h ? -1.0f : 1.0f;
-        flip._12 = 0.0f;
-        flip._21 = 0.0f;
-        flip._22 = g_app.mirror_v ? -1.0f : 1.0f;
-        flip._31 = g_app.mirror_h ? full_cx * 2.0f : 0.0f;
-        flip._32 = g_app.mirror_v ? full_cy * 2.0f : 0.0f;
-        m = luma_matrix_mul(m, flip);
-    }
-
-    draw_soft_shadow(rect_inset(g_app.image_rect, -4.0f, -4.0f), 22.0f, 0.95f);
-    clip = push_round_clip(g_app.image_rect, 18.0f);
-    g_app.rt->lpVtbl->SetTransform(g_app.rt, &m);
-    dest.left = 0.0f;
-    dest.top = 0.0f;
-    dest.right = bw;
-    dest.bottom = bh;
-    g_app.rt->lpVtbl->DrawBitmap(g_app.rt, g_app.bitmap, &dest, 1.0f,
-                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                                 NULL);
-    identity = luma_identity_matrix();
-    g_app.rt->lpVtbl->SetTransform(g_app.rt, &identity);
-    pop_round_clip(&clip);
-    border = g_app.image_rect;
-    stroke_rounded(border, 18.0f, color_alpha(t->on_surface, 0.12f), 1.0f, NULL);
 }
 
-static void crop_handle_corner(float x, float y, float dx, float dy) {
-    Color white = rgba(0xFFFFFF, 0.96f);
-    Color shadow = rgba(0x000000, 0.28f);
-    float len = 18.0f;
-    Rect h = rect_make(dx > 0.0f ? x : x - len,
-                       y - 2.0f,
-                       dx > 0.0f ? x + len : x,
-                       y + 2.0f);
-    Rect v = rect_make(x - 2.0f,
-                       dy > 0.0f ? y : y - len,
-                       x + 2.0f,
-                       dy > 0.0f ? y + len : y);
-    fill_rounded(rect_offset(h, 0.0f, 1.0f), 2.0f, shadow);
-    fill_rounded(rect_offset(v, 1.0f, 0.0f), 2.0f, shadow);
-    fill_rounded(h, 2.0f, white);
-    fill_rounded(v, 2.0f, white);
-}
+/* ------------------------------------------------------------ result queue */
 
-static void draw_crop_overlay(void) {
-    Rect ir = g_app.image_rect;
-    Rect cr;
-    Rect dim_top;
-    Rect dim_bottom;
-    Rect dim_left;
-    Rect dim_right;
-    wchar_t info[96];
-    const wchar_t *preset;
-    float x1;
-    float y1;
-    float x2;
-    float y2;
-    float info_w;
-    Rect info_rect;
-    int rw;
-    int rh;
-    Color dim = rgba(0x000000, 0.52f);
-    Color white = rgba(0xFFFFFF, 0.92f);
-    Color grid = rgba(0xFFFFFF, 0.28f);
-    int i;
-
-    if (!g_app.crop_mode || !g_app.image_visible) return;
-    x1 = ir.left + rect_w(ir) * g_app.crop.left;
-    y1 = ir.top + rect_h(ir) * g_app.crop.top;
-    x2 = ir.left + rect_w(ir) * g_app.crop.right;
-    y2 = ir.top + rect_h(ir) * g_app.crop.bottom;
-    cr = rect_make(x1, y1, x2, y2);
-
-    dim_top = rect_make(ir.left, ir.top, ir.right, y1);
-    dim_bottom = rect_make(ir.left, y2, ir.right, ir.bottom);
-    dim_left = rect_make(ir.left, y1, x1, y2);
-    dim_right = rect_make(x2, y1, ir.right, y2);
-    fill_rect(dim_top, dim);
-    fill_rect(dim_bottom, dim);
-    fill_rect(dim_left, dim);
-    fill_rect(dim_right, dim);
-
-    for (i = 1; i <= 2; ++i) {
-        float gx = cr.left + rect_w(cr) * (float)i / 3.0f;
-        float gy = cr.top + rect_h(cr) * (float)i / 3.0f;
-        line(gx, cr.top, gx, cr.bottom, grid, 1.0f);
-        line(cr.left, gy, cr.right, gy, grid, 1.0f);
-    }
-    stroke_rect(rect_inset(cr, -0.5f, -0.5f), rgba(0x000000, 0.28f), 3.0f);
-    stroke_rect(cr, white, 1.5f);
-
-    crop_handle_corner(cr.left, cr.top, 1.0f, 1.0f);
-    crop_handle_corner(cr.right, cr.top, -1.0f, 1.0f);
-    crop_handle_corner(cr.left, cr.bottom, 1.0f, -1.0f);
-    crop_handle_corner(cr.right, cr.bottom, -1.0f, -1.0f);
-    fill_rounded(rect_make(rect_cx(cr) - 8.0f, cr.top - 1.5f,
-                           rect_cx(cr) + 8.0f, cr.top + 1.5f),
-                 1.5f, white);
-    fill_rounded(rect_make(rect_cx(cr) - 8.0f, cr.bottom - 1.5f,
-                           rect_cx(cr) + 8.0f, cr.bottom + 1.5f),
-                 1.5f, white);
-    fill_rounded(rect_make(cr.left - 1.5f, rect_cy(cr) - 8.0f, cr.left + 1.5f,
-                           rect_cy(cr) + 8.0f),
-                 1.5f, white);
-    fill_rounded(rect_make(cr.right - 1.5f, rect_cy(cr) - 8.0f,
-                           cr.right + 1.5f, rect_cy(cr) + 8.0f),
-                 1.5f, white);
-
-    preset = (g_app.crop_preset >= 0 && g_app.crop_preset < 8)
-                 ? RATIOS[g_app.crop_preset].label
-                 : L"∞";
-    rotated_pixel_size(&rw, &rh);
-    swprintf(info, 96, L"%ls  ·  %d × %d", preset,
-             (int)floorf((float)rw * (g_app.crop.right - g_app.crop.left) +
-                         0.5f),
-             (int)floorf((float)rh * (g_app.crop.bottom - g_app.crop.top) +
-                         0.5f));
-    info_w = text_width(info, g_app.f_tiny) + 24.0f;
-    info_rect = rect_make(cr.left, cr.top - 34.0f, cr.left + info_w,
-                          cr.top - 10.0f);
-    if (info_rect.top < g_app.canvas.top + 8.0f) {
-        info_rect = rect_offset(info_rect, 0.0f,
-                                cr.top + 10.0f - info_rect.top);
-    }
-    if (info_rect.right > g_app.canvas.right - 10.0f) {
-        info_rect = rect_offset(info_rect,
-                                g_app.canvas.right - 10.0f - info_rect.right,
-                                0.0f);
-    }
-    fill_rounded(info_rect, 12.0f, rgba(0x1C1B20, 0.86f));
-    draw_text_raw(info, g_app.f_tiny, info_rect, white, 1, 1, false, true);
-}
-
-static void draw_spinner(float cx, float cy, float radius) {
-    float angle = fmodf((float)g_app.now * 240.0f, 360.0f);
-    stroke_ellipse(cx, cy, radius, radius,
-                   color_alpha(g_app.theme.on_surface, 0.14f), 2.4f);
-    draw_arc(cx, cy, radius, angle, 260.0f, g_app.theme.primary, 2.4f);
-}
-
-static void draw_empty_state(void) {
-    LumaTheme *t = &g_app.theme;
-    float cw = rect_w(g_app.canvas);
-    float ch = rect_h(g_app.canvas);
-    float card_w = fminf(430.0f, cw - 64.0f);
-    float card_h = fminf(252.0f, ch - 48.0f);
-    float cx = rect_cx(g_app.canvas);
-    float cy = rect_cy(g_app.canvas);
-    Rect card;
-    float top;
-    Rect illustration;
-    Rect photo;
-    Rect keycap;
-    float key_w = 58.0f;
-
-    if (card_w < 280.0f) card_w = cw - 32.0f;
-    if (card_h < 210.0f) card_h = ch - 32.0f;
-    card = rect_make(cx - card_w * 0.5f, cy - card_h * 0.5f + 6.0f,
-                     cx + card_w * 0.5f, cy + card_h * 0.5f + 6.0f);
-    top = card.top;
-
-    draw_soft_shadow(card, 26.0f, 0.65f);
-    fill_rounded(card, 26.0f,
-                 color_mix(t->container_lowest, t->surface, g_app.dark ? 0.25f
-                                                                      : 0.35f));
-    stroke_rounded(rect_inset(card, 0.5f, 0.5f), 25.5f,
-                   color_alpha(t->outline_variant, 0.5f), 1.0f, NULL);
-
-    illustration = rect_make(cx - 52.0f, top + 35.0f, cx + 52.0f, top + 139.0f);
-    fill_ellipse(rect_cx(illustration), rect_cy(illustration), 50.0f, 50.0f,
-                 color_alpha(t->primary_container, g_app.dark ? 0.5f : 0.72f));
-    stroke_ellipse(rect_cx(illustration), rect_cy(illustration), 50.0f, 50.0f,
-                   color_alpha(t->primary, 0.18f), 1.0f);
-    photo = rect_make(cx - 37.0f, top + 61.0f, cx + 37.0f, top + 119.0f);
-    fill_rounded(rect_offset(photo, 0.0f, 4.0f), 13.0f,
-                 color_alpha(t->shadow, 0.12f));
-    fill_rounded(photo, 13.0f, t->surface_bright);
-    stroke_rounded(photo, 13.0f, color_alpha(t->outline_variant, 0.7f), 1.0f,
-                   NULL);
-    draw_icon(ICON_IMAGE,
-              rect_make(rect_cx(photo) - 16.0f, rect_cy(photo) - 15.0f,
-                        rect_cx(photo) + 16.0f, rect_cy(photo) + 15.0f),
-              t->primary);
-    fill_ellipse(photo.right - 3.0f, photo.bottom - 3.0f, 10.0f, 10.0f,
-                 t->primary);
-    line(photo.right - 8.0f, photo.bottom - 3.0f, photo.right + 2.0f,
-         photo.bottom - 3.0f, t->on_primary, 1.6f);
-    line(photo.right - 3.0f, photo.bottom - 8.0f, photo.right - 3.0f,
-         photo.bottom + 2.0f, t->on_primary, 1.6f);
-    draw_icon(ICON_SPARKLE, rect_make(cx + 34.0f, top + 49.0f, cx + 54.0f,
-                                      top + 69.0f),
-              t->tertiary);
-
-    keycap = rect_make(cx - key_w * 0.5f, top + 182.0f,
-                       cx + key_w * 0.5f, top + 210.0f);
-    draw_keycap(keycap, L"Ctrl O");
-}
-
-static void draw_loading_state(void) {
-    LumaTheme *t = &g_app.theme;
-    Rect card;
-    float cx = rect_cx(g_app.canvas);
-    float cy = rect_cy(g_app.canvas);
-    float name_w = 0.0f;
-    float card_w = 92.0f;
-    Rect name_rect;
-
-    fill_rect(g_app.canvas, color_alpha(t->canvas, 0.62f));
-    if (g_app.loading_name[0]) {
-        name_w = fminf(text_width(g_app.loading_name, g_app.f_caption), 220.0f);
-        card_w = name_w + 86.0f;
-    }
-    card = rect_make(cx - card_w * 0.5f, cy - 32.0f,
-                     cx + card_w * 0.5f, cy + 32.0f);
-    draw_soft_shadow(card, 18.0f, 0.7f);
-    fill_rounded(card, 18.0f, t->surface);
-    stroke_rounded(card, 18.0f, color_alpha(t->outline_variant, 0.55f), 1.0f,
-                   NULL);
-    draw_spinner(card.left + 34.0f, rect_cy(card), 14.0f);
-    if (name_w > 0.0f) {
-        name_rect = rect_make(card.left + 62.0f, card.top + 10.0f,
-                              card.right - 16.0f, card.bottom - 10.0f);
-        draw_text_trimmed(g_app.loading_name, g_app.f_caption, name_rect,
-                          t->on_surface_variant, false);
-    }
-}
-
-static void draw_zoom_pill(void) {
-    LumaTheme *t = &g_app.theme;
-    wchar_t label[32];
-    float tw;
-    Rect pill;
-    bool has_label;
-    if (!g_app.image_visible || g_app.crop_mode) return;
-    has_label = fabsf(g_app.zoom - 1.0f) >= 0.01f;
-    if (has_label) swprintf(label, 32, L"%d%%", (int)(g_app.zoom * 100.0f + 0.5f));
-    else label[0] = L'\0';
-    tw = has_label ? text_width(label, g_app.f_tiny) : 0.0f;
-    pill = rect_make(g_app.canvas.right - 22.0f - (tw + (has_label ? 38.0f : 36.0f)),
-                     g_app.canvas.bottom - 22.0f - 28.0f,
-                     g_app.canvas.right - 22.0f,
-                     g_app.canvas.bottom - 22.0f);
-    fill_rounded(pill, 10.0f, color_alpha(t->surface, 0.94f));
-    stroke_rounded(pill, 10.0f, color_alpha(t->outline_variant, 0.6f), 1.0f,
-                   NULL);
-    draw_icon(ICON_ZOOM,
-              rect_make(pill.left + (has_label ? 8.0f : 11.0f),
-                        rect_cy(pill) - 7.0f,
-                        pill.left + (has_label ? 22.0f : 25.0f),
-                        rect_cy(pill) + 7.0f),
-              t->on_surface_variant);
-    if (has_label) {
-        draw_text_raw(label, g_app.f_tiny,
-                      rect_make(pill.left + 26.0f, pill.top, pill.right - 8.0f,
-                                pill.bottom),
-                      t->on_surface, 0, 1, false, true);
-    }
-}
-
-static void draw_toast(void) {
-    LumaTheme *t = &g_app.theme;
-    Color bg;
-    Color fg;
-    float alpha;
-    float tw;
-    float width;
-    Rect card;
-    Rect text;
-    Color icon_color;
-
-    if (!g_app.toast_active) return;
-    if (g_app.now > g_app.toast_until) {
-        g_app.toast_active = false;
+static void finish_load(FusApp *app, Result *res) {
+    if (res->gen != app->load_gen) {
+        luma_image_free(&res->image);
         return;
     }
-    alpha = clampf((float)(g_app.now - g_app.toast_start) / 0.12f, 0.0f, 1.0f);
-    alpha = fminf(alpha,
-                  clampf((float)(g_app.toast_until - g_app.now) / 0.28f, 0.0f,
-                         1.0f));
-    if (alpha <= 0.0f) return;
-    if (g_app.toast_error) {
-        bg = t->error_container;
-        fg = t->on_error_container;
-        icon_color = t->error;
+    if (res->upgrade) {
+        if (res->ok) {
+            UINT old_w = (UINT)app->img_w;
+            UINT old_h = (UINT)app->img_h;
+
+            /* the on-screen bitmap carries the filters already, so only swap
+               the pixels when the new decode is actually bigger */
+            if (res->image.width > old_w || res->image.height > old_h) {
+                luma_image_free(&app->base);
+                app->base = res->image;
+                ZeroMemory(&res->image, sizeof res->image);
+                app->img_w = (float)app->base.width;
+                app->img_h = (float)app->base.height;
+                upload_bitmap(app, &app->base);
+                app->fade = 1.0f;
+                app->fade_active = false;
+                ui_invalidate(app);
+                tlog("upgrade_done");
+            }
+        }
+        luma_image_free(&res->image);
+        app->loading = false;
+        ensure_timer(app);
+        return;
+    }
+    app->loading = false;
+    if (!res->ok) {
+        ui_snackbar(app, res->error[0] != L'\0' ? res->error
+                                                : L"打不开这张图片",
+                    NULL, ACT_NONE);
+        ui_invalidate(app);
+        ensure_timer(app);
+        return;
+    }
+    luma_image_free(&app->base);
+    app->base = res->image;
+    ZeroMemory(&res->image, sizeof res->image);
+    app->have_base = true;
+    app->has_image = true;
+    app->img_w = (float)app->base.width;
+    app->img_h = (float)app->base.height;
+    app->rotation = 0;
+    app->mirror_h = false;
+    app->mirror_v = false;
+    app->grayscale = false;
+    app->invert = false;
+    app->crop.left = 0.0f;
+    app->crop.top = 0.0f;
+    app->crop.right = 1.0f;
+    app->crop.bottom = 1.0f;
+    app->crop_preset = 0;
+    app->cropping = false;
+    app->fit = true;
+    app->zoom = 1.0f;
+    app->pan_x = 0.0f;
+    app->pan_y = 0.0f;
+    {
+        const wchar_t *slash = wcsrchr(res->path, L'\\');
+        wcsncpy(app->path, res->path, MAX_PATH - 1);
+        wcsncpy(app->name, slash != NULL ? slash + 1 : res->path, MAX_PATH - 1);
+    }
+    tlog("load_done");
+    /* Test hook: FUST_AUTOSAVE=<path> exercises the dialog-free part of the
+       save path once per process (worker thread + result handling). */
+    {
+        static int auto_saved;
+        const wchar_t *auto_path = _wgetenv(L"FUST_AUTOSAVE");
+        if (!auto_saved && auto_path != NULL && auto_path[0] != L'\0') {
+            auto_saved = 1;
+            start_export(auto_path);
+        }
+    }
+    app->fade = 0.0f;
+    app->fade_active = true;
+    app->fade_start_ms = now64();
+    update_title(app);
+    app->undo_len = 1;
+    app->undo_pos = 0;
+    app->undo[0] = state_now(app);
+    upload_bitmap(app, &app->base);
+    ui_invalidate(app);
+    ensure_timer(app);
+    if ((int)app->img_w >= (int)PREVIEW_MAX ||
+        (int)app->img_h >= (int)PREVIEW_MAX) {
+        start_upgrade(app->path, app->load_gen);
+    }
+}
+
+static void finish_filter(FusApp *app, Result *res) {
+    if (res->gen != app->load_gen) {
+        luma_image_free(&res->image);
+        return;
+    }
+    upload_bitmap(app, &res->image);
+    luma_image_free(&res->image);
+    ui_invalidate(app);
+}
+
+static void finish_export(FusApp *app, Result *res) {
+    app->exporting = false;
+    if (res->ok) {
+        ui_snackbar(app, L"已保存", NULL, ACT_NONE);
     } else {
-        bg = t->inverse_surface;
-        fg = t->inverse_on_surface;
-        icon_color = t->inverse_on_surface;
+        ui_snackbar(app, res->error[0] != L'\0' ? res->error : L"保存失败", NULL,
+                    ACT_NONE);
     }
-    if (!g_app.toast_error) {
-        width = 54.0f;
-        card = rect_make(rect_cx(g_app.canvas) - width * 0.5f,
-                         g_app.canvas.bottom - 28.0f - 46.0f -
-                             (g_app.crop_mode ? 40.0f : 0.0f),
-                         rect_cx(g_app.canvas) + width * 0.5f,
-                         g_app.canvas.bottom - 28.0f -
-                             (g_app.crop_mode ? 40.0f : 0.0f));
-        fill_rounded(card, 14.0f, color_alpha(bg, alpha * 0.97f));
-        stroke_rounded(card, 14.0f,
-                       color_alpha(t->outline, alpha * 0.4f), 1.0f, NULL);
-        draw_icon(ICON_CHECK,
-                  rect_make(rect_cx(card) - 10.0f, rect_cy(card) - 10.0f,
-                            rect_cx(card) + 10.0f, rect_cy(card) + 10.0f),
-                  color_alpha(icon_color, alpha));
-        return;
-    }
-
-    tw = text_width(g_app.toast, g_app.f_body_strong);
-    width = fminf(rect_w(g_app.canvas) - 48.0f, tw + 64.0f);
-    if (width < 180.0f) width = 180.0f;
-    card = rect_make(rect_cx(g_app.canvas) - width * 0.5f,
-                     g_app.canvas.bottom - 28.0f - 46.0f -
-                         (g_app.crop_mode ? 40.0f : 0.0f),
-                     rect_cx(g_app.canvas) + width * 0.5f,
-                     g_app.canvas.bottom - 28.0f -
-                         (g_app.crop_mode ? 40.0f : 0.0f));
-    fill_rounded(card, 14.0f, color_alpha(bg, alpha * 0.97f));
-    stroke_rounded(card, 14.0f,
-                   color_alpha(t->error, alpha * 0.4f), 1.0f, NULL);
-    draw_icon(ICON_INFO,
-              rect_make(card.left + 16.0f, rect_cy(card) - 9.0f,
-                        card.left + 34.0f, rect_cy(card) + 9.0f),
-              color_alpha(icon_color, alpha));
-    text = rect_make(card.left + 42.0f, card.top + 4.0f, card.right - 14.0f,
-                     card.bottom - 4.0f);
-    draw_text_trimmed(g_app.toast, g_app.f_body_strong, text,
-                      color_alpha(fg, alpha), true);
+    ui_invalidate(app);
+    ensure_timer(app);
 }
 
-static void paint_canvas(void) {
-    LumaTheme *t = &g_app.theme;
-    float x;
-    float y;
-    Rect clip = g_app.canvas;
-    Color dot_color;
+/* --------------------------------------------------------------- window */
 
-    if (rect_w(clip) <= 0.0f || rect_h(clip) <= 0.0f) return;
-    g_app.rt->lpVtbl->PushAxisAlignedClip(g_app.rt, &clip,
-                                          D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    fill_rect(g_app.canvas, t->canvas);
-    fill_ellipse(g_app.canvas.left + rect_w(g_app.canvas) * 0.18f,
-                 g_app.canvas.top + rect_h(g_app.canvas) * 0.18f,
-                 rect_w(g_app.canvas) * 0.28f, rect_h(g_app.canvas) * 0.30f,
-                 color_alpha(t->primary, g_app.dark ? 0.035f : 0.028f));
-    fill_ellipse(g_app.canvas.right - rect_w(g_app.canvas) * 0.12f,
-                 g_app.canvas.bottom - rect_h(g_app.canvas) * 0.08f,
-                 rect_w(g_app.canvas) * 0.22f, rect_h(g_app.canvas) * 0.24f,
-                 color_alpha(t->tertiary, g_app.dark ? 0.03f : 0.022f));
+static void apply_dark_title(HWND hwnd, bool dark) {
+    BOOL value = dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd, 20, &value, sizeof value);
+    DwmSetWindowAttribute(hwnd, 19, &value, sizeof value);
+    {
+        int corner = 2; /* DWMWCP_ROUND */
+        DwmSetWindowAttribute(hwnd, 33, &corner, sizeof corner);
+    }
+}
 
-    dot_color = color_alpha(t->on_surface, g_app.dark ? 0.08f : 0.045f);
-    for (y = g_app.canvas.top + 16.0f; y < g_app.canvas.bottom;
-         y += 24.0f) {
-        for (x = g_app.canvas.left + 16.0f; x < g_app.canvas.right;
-             x += 24.0f) {
-            fill_ellipse(x, y, 0.9f, 0.9f, dot_color);
+static void fit_initial_rect(RECT *out) {
+    RECT work;
+    int width_dp = 1320;
+    int height_dp = 820;
+    float scale = (float)GetDpiForSystem() / 96.0f;
+    int w;
+    int h;
+
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    w = (int)(width_dp * scale);
+    h = (int)(height_dp * scale);
+    if (w > work.right - work.left - 48) {
+        w = work.right - work.left - 48;
+    }
+    if (h > work.bottom - work.top - 48) {
+        h = work.bottom - work.top - 48;
+    }
+    out->left = work.left + ((work.right - work.left) - w) / 2;
+    out->top = work.top + ((work.bottom - work.top) - h) / 2;
+    out->right = out->left + w;
+    out->bottom = out->top + h;
+}
+
+static bool load_theme_pref(void) {
+    HKEY key;
+    DWORD value = 0;
+    DWORD size = sizeof value;
+    bool dark = false;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Fustimage", 0, KEY_READ,
+                      &key) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(key, L"theme", NULL, NULL, (BYTE *)&value,
+                             &size) == ERROR_SUCCESS) {
+            dark = value != 0;
         }
+        RegCloseKey(key);
     }
+    return dark;
+}
 
-    if (g_app.has_image && g_app.image_visible) {
-        draw_photo();
-        if (g_app.crop_mode) draw_crop_overlay();
+static void save_theme_pref(bool dark) {
+    HKEY key;
+    DWORD value = dark ? 1 : 0;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Fustimage", 0, NULL, 0,
+                        KEY_WRITE, NULL, &key, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(key, L"theme", 0, REG_DWORD, (const BYTE *)&value,
+                       sizeof value);
+        RegCloseKey(key);
     }
-    if (g_app.loading) {
-        if (!g_app.has_image) {
-            fill_rect(g_app.canvas, t->canvas);
-            draw_loading_state();
+}
+
+static void set_cursor_for(float x, float y) {
+    FusApp *app = &g_app;
+    if (app->cropping && canvas_contains(app, x, y)) {
+        SetCursor(g_cursor_cross);
+    } else if (app->has_image && canvas_contains(app, x, y)) {
+        SetCursor(app->panning ? g_cursor_cross : g_cursor_hand);
+    } else {
+        int action = ACT_NONE;
+        if (ui_hit_test(app, x, y, &action, NULL) && action != ACT_NONE) {
+            SetCursor(g_cursor_hand);
         } else {
-            draw_loading_state();
+            SetCursor(g_cursor_arrow);
         }
-    } else if (!g_app.has_image) {
-        draw_empty_state();
-    }
-    if (g_app.has_image && !g_app.loading) draw_zoom_pill();
-    draw_toast();
-    g_app.rt->lpVtbl->PopAxisAlignedClip(g_app.rt);
-}
-
-static void paint_tooltip(void) {
-    LumaControl *c;
-    wchar_t text[160];
-    float tw, left, top;
-    Rect tip;
-    if (g_app.hover_id < 0 || g_app.mouse_down || g_app.pressed_id != -1) return;
-    if (GetTickCount64() - g_app.hover_since < 650) return;
-    c = find_control(g_app.hover_id);
-    if (c == NULL || c->tooltip == NULL || c->tooltip[0] == L'\0') return;
-    wcsncpy(text, c->tooltip, 159);
-    text[159] = L'\0';
-    tw = text_width(text, g_app.f_caption);
-    left = rect_cx(c->rect) - tw * 0.5f - 10.0f;
-    if (left < 8.0f) left = 8.0f;
-    if (left + tw + 20.0f > g_app.width - 8.0f)
-        left = g_app.width - tw - 28.0f;
-    top = c->rect.top - 32.0f;
-    if (top < 6.0f) top = c->rect.bottom + 6.0f;
-    tip = rect_make(left, top, left + tw + 20.0f, top + 26.0f);
-    fill_rounded(tip, 8.0f, color_alpha(g_app.theme.inverse_surface, 0.96f));
-    draw_text_raw(text, g_app.f_caption, tip, g_app.theme.inverse_on_surface, 1,
-                  1, false, true);
-}
-
-static void paint_app(void) {
-    HRESULT hr;
-    D2D1_MATRIX_3X2_F identity;
-    if (g_app.rt == NULL) return;
-    identity = luma_identity_matrix();
-    g_app.rt->lpVtbl->SetTransform(g_app.rt, &identity);
-    g_app.rt->lpVtbl->BeginDraw(g_app.rt);
-    g_app.rt->lpVtbl->Clear(g_app.rt, &g_app.theme.surface);
-    paint_sidebar();
-    paint_appbar();
-    paint_canvas();
-    paint_tooltip();
-    hr = g_app.rt->lpVtbl->EndDraw(g_app.rt, NULL, NULL);
-    if (hr == D2DERR_RECREATE_TARGET) {
-        discard_device_resources();
-        InvalidateRect(g_app.hwnd, NULL, FALSE);
     }
 }
 
-#include "ui_actions.inc"
-#include "ui_window.inc"
+static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam,
+                                    LPARAM lparam) {
+    FusApp *app = &g_app;
 
+    switch (message) {
+    case WM_CREATE:
+        app->hwnd = hwnd;
+        return 0;
 
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wparam;
+        RECT rc;
+        if (app->rt != NULL) {
+            /* the D2D target paints the whole client area every frame; a GDI
+               erase on top of it is wasted work and shows up as a flicker */
+            return 1;
+        }
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_erase_brush != NULL ? g_erase_brush
+                                                : (HBRUSH)(COLOR_WINDOW + 1));
+        return 1;
+    }
 
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        /* BeginPaint first: it clears the pending erase flag, so the frame we
+           draw below is not wiped by the background fill afterwards. */
+        BeginPaint(hwnd, &ps);
+        if (app->rt == NULL) {
+            /* the target is dropped on a theme switch, DPI change or device
+               loss: build a fresh one before drawing anything */
+            create_target(app);
+        }
+        if (app->rt != NULL) {
+            paint_client(app);
+        }
+        if (app->target_lost) {
+            /* the surface went away (dialog, display change, device reset):
+               rebuild it now and repaint on the next tick */
+            app->target_lost = false;
+            discard_target(app);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        EndPaint(hwnd, &ps); /* validates the update region */
+        return 0;
+    }
 
+    case WM_SIZE:
+        if (wparam != SIZE_MINIMIZED && app->rt != NULL) {
+            D2D1_SIZE_U size;
+            size.width = (UINT)LOWORD(lparam);
+            size.height = (UINT)HIWORD(lparam);
+            if (size.width > 0 && size.height > 0) {
+                app->rt->lpVtbl->Resize(app->rt, &size);
+            }
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_TIMER:
+        if (wparam == TIMER_ANIM) {
+            tick(app);
+            if (!ui_animation_active(app)) {
+                KillTimer(hwnd, TIMER_ANIM);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_APP_RESULT: {
+        Result *res = (Result *)lparam;
+        if (res != NULL) {
+            tick(app);
+            if (res->kind == RES_LOADED) {
+                finish_load(app, res);
+            } else if (res->kind == RES_FILTERED) {
+                finish_filter(app, res);
+            } else {
+                finish_export(app, res);
+            }
+            luma_image_free(&res->image);
+            free(res);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+        tick(app);
+        if (!g_tracking_leave) {
+            TRACKMOUSEEVENT track;
+            track.cbSize = sizeof track;
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = hwnd;
+            track.dwHoverTime = 0;
+            g_tracking_leave = TrackMouseEvent(&track) != 0;
+        }
+        {
+            float x = (float)GET_X_LPARAM(lparam);
+            float y = (float)GET_Y_LPARAM(lparam);
+            if (app->panning && app->has_image) {
+                if (app->cropping) {
+                    crop_update(app, x, y);
+                } else {
+                    app->pan_x = app->pan_start_x + (x - app->pan_origin.x);
+                    app->pan_y = app->pan_start_y + (y - app->pan_origin.y);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            } else {
+                ui_pointer_move(app, x, y);
+            }
+            set_cursor_for(x, y);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        g_tracking_leave = false;
+        ui_pointer_leave(app);
+        return 0;
+
+    case WM_SETCURSOR:
+        return TRUE; /* WM_MOUSEMOVE keeps the cursor current */
+
+    case WM_LBUTTONDOWN:
+        tick(app);
+        SetCapture(hwnd);
+        {
+            float x = (float)GET_X_LPARAM(lparam);
+            float y = (float)GET_Y_LPARAM(lparam);
+            ui_pointer_down(app, x, y);
+            if (app->active != ACT_NONE) {
+                app->ripple_action = app->active;
+                app->ripple_x = x;
+                app->ripple_y = y;
+                app->ripple_ms = GetTickCount64();
+                ensure_timer(app);
+                InvalidateRect(hwnd, NULL, FALSE);
+                /* a HUD control (crop confirm bar, chips, ...) took the
+                   press -- do not start a canvas gesture under it */
+                return 0;
+            }
+            if (app->cropping && canvas_contains(app, x, y)) {
+                crop_begin(app, x, y);
+            } else if (app->has_image && !app->cropping &&
+                       canvas_contains(app, x, y)) {
+                app->panning = true;
+                app->pan_origin.x = (LONG)x;
+                app->pan_origin.y = (LONG)y;
+                app->pan_start_x = app->pan_x;
+                app->pan_start_y = app->pan_y;
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        tick(app);
+        ReleaseCapture();
+        {
+            float x = (float)GET_X_LPARAM(lparam);
+            float y = (float)GET_Y_LPARAM(lparam);
+            if (app->panning) {
+                app->panning = false;
+                if (app->cropping) {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            } else {
+                ui_pointer_up(app, x, y);
+            }
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL: {
+        POINT pt;
+        pt.x = GET_X_LPARAM(lparam);
+        pt.y = GET_Y_LPARAM(lparam);
+        ScreenToClient(hwnd, &pt);
+        {
+            int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            float factor = delta > 0 ? 1.15f : (delta < 0 ? 1.0f / 1.15f : 1.0f);
+            zoom_at((float)pt.x, (float)pt.y, factor);
+        }
+        return 0;
+    }
+
+    case WM_KEYDOWN:
+        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            if (wparam == 'O') {
+                app_action(ACT_OPEN);
+                return 0;
+            }
+            if (wparam == 'S') {
+                app_action(ACT_SAVE);
+                return 0;
+            }
+            if (wparam == 'Z') {
+                app_action((GetKeyState(VK_SHIFT) & 0x8000) != 0 ? ACT_REDO
+                                                                : ACT_UNDO);
+                return 0;
+            }
+            if (wparam == 'Y') {
+                app_action(ACT_REDO);
+                return 0;
+            }
+            if (wparam == '0') {
+                app_action(ACT_ZOOM_100);
+                return 0;
+            }
+            if (wparam == 'F') {
+                app_action(ACT_ZOOM_FIT);
+                return 0;
+            }
+        }
+        if (wparam == 'R' && app->has_image) {
+            app_action((GetKeyState(VK_SHIFT) & 0x8000) != 0
+                           ? ACT_ROTATE_CCW
+                           : ACT_ROTATE_CW);
+            return 0;
+        }
+        if (wparam == 'H' && app->has_image) {
+            app_action((GetKeyState(VK_SHIFT) & 0x8000) != 0 ? ACT_FLIP_V
+                                                             : ACT_FLIP_H);
+            return 0;
+        }
+        if (wparam == 'T') {
+            app_action(ACT_THEME);
+            return 0;
+        }
+        if ((wparam == VK_OEM_PLUS || wparam == VK_ADD) && app->has_image) {
+            zoom_at((app->canvas.left + app->canvas.right) * 0.5f,
+                    (app->canvas.top + app->canvas.bottom) * 0.5f, 1.15f);
+            return 0;
+        }
+        if ((wparam == VK_OEM_MINUS || wparam == VK_SUBTRACT) &&
+            app->has_image) {
+            zoom_at((app->canvas.left + app->canvas.right) * 0.5f,
+                    (app->canvas.top + app->canvas.bottom) * 0.5f,
+                    1.0f / 1.15f);
+            return 0;
+        }
+        if (wparam == VK_ESCAPE && app->cropping) {
+            crop_cancel(app);
+            return 0;
+        }
+        if (wparam == VK_RETURN && app->cropping) {
+            crop_commit(app);
+            return 0;
+        }
+        if (wparam == VK_DELETE) {
+            return 0;
+        }
+        break;
+
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)wparam;
+        wchar_t path[MAX_PATH];
+        if (DragQueryFileW(drop, 0, path, MAX_PATH) > 0) {
+            start_load(path);
+        }
+        DragFinish(drop);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        RECT *suggested = (RECT *)lparam;
+        app->dpi = (float)HIWORD(wparam);
+        SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        discard_target(app);
+        create_target(app);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *info = (MINMAXINFO *)lparam;
+        float scale = app->dpi > 0.0f ? app->dpi / 96.0f : 1.0f;
+        info->ptMinTrackSize.x = (LONG)(640.0f * scale);
+        info->ptMinTrackSize.y = (LONG)(480.0f * scale);
+        return 0;
+    }
+
+    case WM_DESTROY:
+        save_theme_pref(app->dark);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+/* ---------------------------------------------------------------- startup */
+
+/* Headless render: Fustimage.exe --shot <out.png> [--dark] [--size=WxH]
+   [--rot=N] [--gray] [--invert] [--crop=N] [--zoom100] <image>
+   Draws the real UI into an offscreen WIC bitmap so screenshots never need a
+   visible window. */
+static int cli_shot(int argc, wchar_t **argv) {
+    FusApp *app = &g_app;
+    const wchar_t *out_path = NULL;
+    const wchar_t *image_path = NULL;
+    bool dark = false, zoom100 = false, cropping = false;
+    int width = 1320, height = 820;
+    int crop_index = -1;
+    int hover_action = ACT_NONE;
+    int ripple_action = ACT_NONE;
+    float ripple_x = 0.0f, ripple_y = 0.0f;
+    int i;
+    HWND hwnd = NULL;
+    IWICImagingFactory *wic = NULL;
+    IWICBitmap *wic_bitmap = NULL;
+    IWICBitmapLock *lock = NULL;
+    ID2D1RenderTarget *rt = NULL;
+    D2D1_COLOR_F black = {0.0f, 0.0f, 0.0f, 1.0f};
+    wchar_t error[512];
+    int rc = 1;
+
+    if (argc > 2) {
+        out_path = argv[2];
+    }
+    for (i = 3; i < argc; i++) {
+        const wchar_t *a = argv[i];
+        if (wcscmp(a, L"--dark") == 0) {
+            dark = true;
+        } else if (wcscmp(a, L"--zoom100") == 0) {
+            zoom100 = true;
+        } else if (wcscmp(a, L"--cropping") == 0) {
+            cropping = true;
+        } else if (wcsncmp(a, L"--hover=", 8) == 0) {
+            hover_action = _wtoi(a + 8);
+        } else if (wcsncmp(a, L"--ripple=", 9) == 0) {
+            int ra = 0;
+            if (swscanf(a + 9, L"%d,%f,%f", &ra, &ripple_x, &ripple_y) == 3) {
+                ripple_action = ra;
+            }
+        } else if (wcscmp(a, L"--gray") == 0) {
+            app->grayscale = true;
+        } else if (wcscmp(a, L"--invert") == 0) {
+            app->invert = true;
+        } else if (wcsncmp(a, L"--rot=", 6) == 0) {
+            app->rotation = _wtoi(a + 6) & 3;
+        } else if (wcsncmp(a, L"--size=", 7) == 0) {
+            int ww = 0, hh = 0;
+            if (swscanf(a + 7, L"%dx%d", &ww, &hh) == 2 && ww > 200 && hh > 200) {
+                width = ww;
+                height = hh;
+            }
+        } else if (wcsncmp(a, L"--crop=", 7) == 0) {
+            crop_index = _wtoi(a + 7);
+        } else if (a[0] != L'-') {
+            image_path = a;
+        }
+    }
+
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"FustimageShot";
+        RegisterClassExW(&wc);
+        hwnd = CreateWindowExW(0, L"FustimageShot", L"shot", WS_POPUP, 0, 0,
+                               width, height, NULL, NULL, wc.hInstance, NULL);
+    }
+    if (hwnd == NULL) {
+        goto done;
+    }
+    app->hwnd = hwnd;
+    app->dpi = 96.0f;
+    app->dark = dark;
+    app->fade = 1.0f;
+    app->fit = !zoom100;
+    app->zoom = 1.0f;
+    app->crop.left = 0.0f;
+    app->crop.top = 0.0f;
+    app->crop.right = 1.0f;
+    app->crop.bottom = 1.0f;
+    app->crop_preset = 0;
+    app->now_ms = now64();
+    app->start_ms = app->now_ms;
+
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                 &IID_ID2D1Factory, NULL,
+                                 (void **)&app->d2d))) {
+        goto done;
+    }
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                                   &k_iid_dwrite_factory,
+                                   (IUnknown **)&app->dw))) {
+        goto done;
+    }
+    theme_apply(app, dark);
+    if (!theme_create_type(app)) {
+        goto done;
+    }
+    icons_get(app->d2d);
+
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL,
+                                CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
+                                (void **)&wic))) {
+        goto done;
+    }
+    if (FAILED(wic->lpVtbl->CreateBitmap(wic, (UINT)width, (UINT)height,
+                                         &GUID_WICPixelFormat32bppPBGRA,
+                                         WICBitmapCacheOnLoad,
+                                         &wic_bitmap))) {
+        goto done;
+    }
+    {
+        D2D1_RENDER_TARGET_PROPERTIES props;
+        ZeroMemory(&props, sizeof props);
+        props.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        props.dpiX = 96.0f;
+        props.dpiY = 96.0f;
+        props.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
+        props.usage = D2D1_RENDER_TARGET_USAGE_NONE;
+        if (FAILED(app->d2d->lpVtbl->CreateWicBitmapRenderTarget(
+                app->d2d, wic_bitmap, &props, &rt))) {
+            goto done;
+        }
+    }
+    app->rt = (ID2D1HwndRenderTarget *)rt;
+    RT(app)->lpVtbl->SetAntialiasMode(RT(app), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    RT(app)->lpVtbl->SetTextAntialiasMode(RT(app),
+                                          D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+    RT(app)->lpVtbl->CreateSolidColorBrush(RT(app), &black, NULL, &app->brush);
+
+    if (image_path != NULL) {
+        ZeroMemory(&app->base, sizeof app->base);
+        if (!luma_image_load(image_path, &app->base, error,
+                             sizeof error / sizeof error[0])) {
+            fwprintf(stderr, L"%ls\n", error);
+            goto done;
+        }
+        app->have_base = true;
+        app->has_image = true;
+        app->img_w = (float)app->base.width;
+        app->img_h = (float)app->base.height;
+        wcsncpy(app->path, image_path, MAX_PATH - 1);
+        {
+            const wchar_t *slash = wcsrchr(image_path, L'\\');
+            wcsncpy(app->name, slash != NULL ? slash + 1 : image_path,
+                    MAX_PATH - 1);
+        }
+        if (app->grayscale || app->invert) {
+            image_apply_filters(&app->base, app->grayscale, app->invert);
+        }
+        upload_bitmap(app, &app->base);
+        if (crop_index >= 0 && crop_index < g_preset_count) {
+            app->crop_preset = crop_index;
+            if (g_presets[crop_index].ratio > 0.0f) {
+                float ow, oh;
+                oriented_dims(app, &ow, &oh);
+                {
+                    float ratio = g_presets[crop_index].ratio;
+                    float cw = 1.0f, ch = 1.0f;
+                    float ir = ow / oh;
+                    if (ir > ratio) {
+                        cw = ratio / ir;
+                    } else {
+                        ch = ir / ratio;
+                    }
+                    app->crop.left = (1.0f - cw) * 0.5f;
+                    app->crop.top = (1.0f - ch) * 0.5f;
+                    app->crop.right = app->crop.left + cw;
+                    app->crop.bottom = app->crop.top + ch;
+                }
+            }
+        }
+    }
+
+    if (cropping) {
+        app->cropping = true;
+        app->crop_work[0] = app->crop.left;
+        app->crop_work[1] = app->crop.top;
+        app->crop_work[2] = app->crop.right;
+        app->crop_work[3] = app->crop.bottom;
+    }
+    if (hover_action != ACT_NONE) {
+        app->hot = hover_action;
+        app->pointer_x = (float)width * 0.55f;
+        app->pointer_y = (float)height * 0.62f;
+    }
+    if (ripple_action != ACT_NONE && app->now_ms == 0) {
+        app->now_ms = 1000;
+    }
+    if (ripple_action != ACT_NONE) {
+        app->ripple_action = ripple_action;
+        app->ripple_x = ripple_x;
+        app->ripple_y = ripple_y;
+        app->ripple_ms = app->now_ms > 150 ? app->now_ms - 150 : 0;
+    }
+    ui_paint(app);
+
+    if (SUCCEEDED(wic_bitmap->lpVtbl->Lock(wic_bitmap, NULL,
+                                           WICBitmapLockRead, &lock))) {
+        UINT ww = 0, hh = 0, stride = 0, buffer = 0;
+        BYTE *data = NULL;
+        wic_bitmap->lpVtbl->GetSize(wic_bitmap, &ww, &hh);
+        lock->lpVtbl->GetStride(lock, &stride);
+        lock->lpVtbl->GetDataPointer(lock, &buffer, &data);
+        if (data != NULL) {
+            LumaImage shot;
+
+            LumaCrop full = {0.0f, 0.0f, 1.0f, 1.0f};
+            shot.width = ww;
+            shot.height = hh;
+            shot.stride = stride;
+            shot.pixels = (uint8_t *)malloc((size_t)stride * hh);
+            if (shot.pixels != NULL) {
+                memcpy(shot.pixels, data, (size_t)stride * hh);
+                if (luma_image_export(&shot, 0, false, false, full, out_path,
+                                      error, sizeof error / sizeof error[0])) {
+                    rc = 0;
+                } else {
+                    fwprintf(stderr, L"%ls\n", error);
+                }
+                free(shot.pixels);
+            }
+        }
+    }
+
+done:
+    if (lock != NULL) fus_release(lock);
+    if (wic_bitmap != NULL) fus_release(wic_bitmap);
+    if (wic != NULL) fus_release(wic);
+    if (app->bitmap != NULL) fus_release(app->bitmap);
+    if (app->checker != NULL) fus_release(app->checker);
+    if (app->brush != NULL) fus_release(app->brush);
+    if (rt != NULL) fus_release(rt);
+    theme_release(app);
+    luma_image_free(&app->base);
+    if (app->dw != NULL) fus_release(app->dw);
+    if (app->d2d != NULL) fus_release(app->d2d);
+    if (hwnd != NULL) {
+        DestroyWindow(hwnd);
+    }
+    CoUninitialize();
+    return rc;
+}
+
+/* Batch mode: Fustimage.exe --export <out.png> <in.jpg> [--rot=N]
+   [--mirror-h] [--mirror-v] [--gray] [--invert] [--crop=l,t,r,b]
+   No window, no COM apartment on the caller: handy for scripts and tests. */
+static int cli_export(int argc, wchar_t **argv) {
+    LumaImage image;
+    wchar_t error[512];
+    int rotation = 0;
+    bool mirror_h = false, mirror_v = false, gray = false, invert = false;
+    LumaCrop crop = {0.0f, 0.0f, 1.0f, 1.0f};
+    int i;
+    bool ok;
+
+    if (argc < 4) {
+        fwprintf(stderr, L"usage: Fustimage.exe --export <out> <in> [options]\n");
+        return 2;
+    }
+    for (i = 4; i < argc; i++) {
+        if (wcscmp(argv[i], L"--gray") == 0) {
+            gray = true;
+        } else if (wcscmp(argv[i], L"--invert") == 0) {
+            invert = true;
+        } else if (wcscmp(argv[i], L"--mirror-h") == 0) {
+            mirror_h = true;
+        } else if (wcscmp(argv[i], L"--mirror-v") == 0) {
+            mirror_v = true;
+        } else if (wcsncmp(argv[i], L"--rot=", 6) == 0) {
+            rotation = _wtoi(argv[i] + 6) & 3;
+        } else if (wcsncmp(argv[i], L"--crop=", 7) == 0) {
+            double l = 0.0, t = 0.0, r = 1.0, b = 1.0;
+            if (swscanf(argv[i] + 7, L"%lf,%lf,%lf,%lf", &l, &t, &r, &b) == 4) {
+                crop.left = (float)l;
+                crop.top = (float)t;
+                crop.right = (float)r;
+                crop.bottom = (float)b;
+            }
+        }
+    }
+    ZeroMemory(&image, sizeof image);
+    if (!luma_image_load(argv[3], &image, error,
+                         sizeof error / sizeof error[0])) {
+        fwprintf(stderr, L"%ls\n", error);
+        return 1;
+    }
+    image_apply_filters(&image, gray, invert);
+    ok = luma_image_export(&image, rotation, mirror_h, mirror_v, crop, argv[2],
+                           error, sizeof error / sizeof error[0]);
+    luma_image_free(&image);
+    if (!ok) {
+        fwprintf(stderr, L"%ls\n", error);
+        return 1;
+    }
+    return 0;
+}
+
+int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command,
+                      int show) {
+    WNDCLASSEXW wc;
+    RECT rect;
+    MSG msg;
+    FusApp *app = &g_app;
+    const wchar_t *class_name = L"FustimageMain";
+    const wchar_t *open_path = NULL;
+
+    (void)previous;
+    (void)command;
+
+    tlog_open();
+    tlog("entry");
+    {
+        int argc = 0;
+        LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv != NULL) {
+            if (argc > 1 && wcscmp(argv[1], L"--export") == 0) {
+                int rc = cli_export(argc, argv);
+                LocalFree(argv);
+                return rc;
+            }
+            if (argc > 1 && wcscmp(argv[1], L"--shot") == 0) {
+                int rc = cli_shot(argc, argv);
+                LocalFree(argv);
+                return rc;
+            }
+            LocalFree(argv);
+        }
+    }
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    app->start_ms = now64();
+    app->now_ms = app->start_ms;
+    app->fade = 1.0f;
+    app->fit = true;
+    app->dpi = (float)GetDpiForSystem();
+    app->dark = load_theme_pref();
+    g_debug_title = GetEnvironmentVariableW(L"FUST_DEBUG_TITLE", NULL, 0) > 0;
+    {
+        int argc = 0;
+        LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv != NULL) {
+            if (argc > 1) {
+                open_path = argv[1];
+            }
+            LocalFree(argv);
+        }
+    }
+
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                 &IID_ID2D1Factory, NULL,
+                                 (void **)&app->d2d))) {
+        return 1;
+    }
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                                   &k_iid_dwrite_factory, (IUnknown **)&app->dw))) {
+        return 1;
+    }
+    theme_apply(app, app->dark);
+    if (!theme_create_type(app)) {
+        return 1;
+    }
+    set_erase_brush(app);
+    tlog("factories");
+
+    g_cursor_arrow = LoadCursorW(NULL, IDC_ARROW);
+    g_cursor_hand = LoadCursorW(NULL, IDC_HAND);
+    g_cursor_cross = LoadCursorW(NULL, IDC_CROSS);
+
+    ZeroMemory(&wc, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = window_proc;
+    wc.hInstance = instance;
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
+    if (wc.hIcon == NULL) {
+        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+    wc.hCursor = g_cursor_arrow;
+    wc.hbrBackground = NULL; /* WM_ERASEBKGND paints the surface colour */
+    wc.lpszClassName = class_name;
+    if (RegisterClassExW(&wc) == 0) {
+        return 1;
+    }
+
+    fit_initial_rect(&rect);
+    CreateWindowExW(0, class_name, L"Fustimage", WS_OVERLAPPEDWINDOW,
+                    rect.left, rect.top, rect.right - rect.left,
+                    rect.bottom - rect.top, NULL, NULL, instance, NULL);
+    if (app->hwnd == NULL) {
+        return 1;
+    }
+    app->dpi = (float)GetDpiForWindow(app->hwnd);
+    apply_dark_title(app->hwnd, app->dark);
+    DragAcceptFiles(app->hwnd, TRUE);
+    tlog("window");
+
+    /* The window appears immediately, in the right colour; the device target
+       and the first real frame follow. */
+    ShowWindow(app->hwnd, show == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : show);
+    UpdateWindow(app->hwnd);
+    tlog("shown");
+    if (create_target(app) == S_OK) {
+        tlog("target");
+        paint_client(app);
+        tlog("paint");
+    }
+    if (open_path != NULL && GetFileAttributesW(open_path) != INVALID_FILE_ATTRIBUTES) {
+        start_load(open_path);
+    }
+    ensure_timer(app);
+
+    tlog("loop");
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    discard_target(app);
+    theme_release(app);
+    luma_image_free(&app->base);
+    if (app->d2d != NULL) fus_release(app->d2d);
+    if (app->dw != NULL) fus_release(app->dw);
+    return (int)msg.wParam;
+}

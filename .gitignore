@@ -2,3 +2,6 @@ build/
 *.o
 *.exe
 test/*.png
+bench/
+*.log
+*.png.tmp

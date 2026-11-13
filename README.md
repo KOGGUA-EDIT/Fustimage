@@ -1,115 +1,98 @@
-# Fustimage — 图片工坊
+# Fustimage
 
-一个用 **C17 + Win32 + Direct2D + DirectWrite + WIC** 写的本地快速图片编辑器。界面采用 Material You 风格，全部功能都在左侧工具栏里用自绘 UI 完成，不依赖网页壳或第三方 GUI 库。
+本地图片编辑器。**C17 + Win32 + Direct2D + DirectWrite + WIC**，界面完全自绘，按 Material Design 3 的规范重写；没有任何网页壳、运行时或第三方 UI 库。
 
-![Fustimage 主界面](screenshots/fustimage-final-light.png)
+![Fustimage 亮色](docs/shots/photo-light.png)
+
+## 这一版改了什么
+
+旧版是「Material You 风格」的自绘界面：单侧栏堆满卡片、双层标题、彩色字节点阵铺满画布、启动时同步建 D3D 硬件设备再显示窗口。
+新版按 MD3 的组件、色调与动态规范重建，并把启动路径重排为「先出窗口、再出内容、再补高清」：
+
+| 指标 | 旧版 | 新版 |
+| --- | --- | --- |
+| 窗口可见 | 277–433 ms | **15–80 ms** |
+| 首帧（窗口有内容） | 436–594 ms | **94–280 ms** |
+| 载入 6000×4000 JPEG | 同步，界面停住 | 预览 140 ms 先上屏，全尺寸 172 ms 后台替换 |
+
+详细测量方法与数据见 [docs/STARTUP.md](docs/STARTUP.md)，MD3 落地清单见 [docs/MD3.md](docs/MD3.md)。
 
 ## 功能
 
-- **打开**：工具栏按钮、`Ctrl+O`、拖放文件，或启动时把图片路径作为参数。
-- **旋转**：左转 90°、右转 90°、左转 180°、右转 180°。旋转卡片只用数字和方向图标表达。
-- **镜像**：水平镜像、垂直镜像，可与旋转组合。
-- **裁剪**：16:9、1:1、9:16、4:3、3:4、3:2、2:3、自由（∞）。
-  - 进入裁剪后可拖动选区移动、拖动边角或边线缩放。
-  - 固定比例会保持像素宽高比。
-  - `Enter` 应用，`Esc` 取消；工具栏也有纯图标的应用/取消按钮。
-- **编辑历史**：撤销、重做；工具栏只显示图标。
-- **导出**：按扩展名选择 PNG、JPEG、BMP 或 TIFF。JPEG 质量 0.92；带透明通道的图片导出为 JPEG/BMP 时会铺白底。
-  - 导出按钮始终打开系统保存对话框，可自选目录、文件名和格式。
-  - 工具栏的“复制”按钮把当前效果直接写到原图旁边，文件名为 `<原名>_copy.<原扩展名>`；重名时自动改用 `_copy-2`、`_copy-3`，不会覆盖原图。
-- **自适应布局**：宽、中、紧凑三档。窗口变窄后工具栏收成图标栏，内容可滚动；窗口变矮时裁剪卡片仍可滚动访问。
-- **浅色 / 深色**：跟随 Material 语义色，标题栏由 DWM 同步着色。
-- **异步载入**：解码在工作线程完成，界面不卡顿。
-- **EXIF 方向**：载入时自动应用手机照片的 1–8 方向标记。
+- **打开**：工具栏按钮、`Ctrl+O`、拖放，或 `Fustimage.exe <图片>`。
+- **旋转 / 镜像**：左转 90°、右转 90°、左转 180°、右转 180°，水平/垂直翻转；可任意组合。
+- **裁剪**：16:9、1:1、9:16、4:3、3:4、3:2、2:3、自由。
+  - 任何比例 chip 都会先进入裁剪模式并把选区拟合到该比例；框内拖动平移、8 个手柄改边/改角（按比例锁定），
+  `Enter`/✓ 应用、`Esc`/✕ 取消；从框外起笔可以拉一个全新的选区。
+  - 应用（✓）/ 取消（✕）放在面板顶部，和第一版一致；`Enter` 应用，`Esc` 取消。
+- **滤镜**：黑白（Rec. 709 亮度）、反色；在预乘 BGRA 上就地计算。
+- **缩放**：滚轮以光标为中心缩放、拖拽平移、「适应 / 100%」分段按钮。
+- **编辑历史**：撤销 / 重做，保存 64 个文档状态（旋转、镜像、裁剪、滤镜一起回退）。
+- **导出**：`Ctrl+S` → 系统保存对话框，按扩展名写 PNG / JPEG（质量 0.92）/ BMP / TIFF；带透明通道的图导出 JPEG / BMP 时自动铺白底。写入临时文件后原子替换，不会写坏原图。
+- **浅色 / 深色**：同一套语义角色，标题栏交给 DWM 同步；选择记在 `HKCU\Software\Fustimage`。
+- **窗口尺寸类**：≥840 dp 用常驻侧栏（340/360 dp），<840 dp 收成工具浮层。
+- **一键另存**：顶栏保存左侧的按钮直接把结果写到源文件旁边（`<名字>-edited<扩展名>`），不弹对话框。
+- **纯图标界面**：顶栏与侧栏全部是图标按钮（打开、保存、另存到源文件旁、旋转、翻转、滤镜、裁剪比例），
+  顶栏不放应用名与徽标，文字只出现在悬停提示与结果提示条里；裁剪比例用数字 chip 表达。
+- **点击反馈**：按下控件时从落点扩散一枚圆形水波纹并淡出，绘制被裁到控件自身范围内。
+- **一体化的顶栏与侧栏**：两者共用 `surface` 底色、中间没有分界线，画布左上角在交界处切成 28 dp 圆角；
+  180° 旋转用 U 形调头箭头表示。
 
-所有处理都在本机完成，不上传图片。
-
-## 操作方式
+## 快捷键
 
 | 操作 | 快捷键 |
 | --- | --- |
-| 打开图片 | `Ctrl+O` |
+| 打开 / 保存 | `Ctrl+O` / `Ctrl+S` |
 | 撤销 / 重做 | `Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`） |
-| 导出 | `Ctrl+S` |
+| 适应窗口 / 100% | `Ctrl+F` / `Ctrl+0` |
+| 放大 / 缩小 | `Ctrl+=` / `Ctrl+-`（滚轮同效） |
 | 右转 / 左转 90° | `R` / `Shift+R` |
-| 水平 / 垂直镜像 | `H` / `Shift+H` |
-| 切换深色/浅色 | `T` |
-| 适应窗口 | `Ctrl+0` 或 `F` |
-| 放大 / 缩小 | `Ctrl+=` / `Ctrl+-` |
-| 应用裁剪 / 取消裁剪 | `Enter` / `Esc` |
-
-鼠标滚轮在工具栏上滚动；在画布上缩放。画布内拖动可平移，双击恢复适应窗口。
+| 水平 / 垂直翻转 | `H` / `Shift+H` |
+| 深 / 浅色 | `T` |
+| 应用 / 取消裁剪 | `Enter` / `Esc` |
 
 ## 构建
 
-需要带 Direct2D、DirectWrite、WIC 头文件和库的 MinGW-w64。当前开发环境使用便携版 w64devkit（GCC 16.2）。
-
 ```powershell
-cd D:\app edit\Fustimage
+# 需要 MinGW-w64（脚本默认 D:\ruanjian\rust-env\w64devkit\bin）
 powershell -ExecutionPolicy Bypass -File .\build.ps1
+# 产物：build\Fustimage.exe
 ```
 
-或直接双击 `build.bat`。脚本优先使用：
+链接：`d2d1 dwrite windowscodecs dwmapi shcore ole32 oleaut32 uuid shell32 comdlg32 gdi32 user32 propsys`。
 
-```
-D:\ruanjian\rust-env\w64devkit\bin
-```
-
-找不到时会退回 PATH 里的 `gcc` / `windres`。输出：
-
-```
-build\Fustimage.exe
-```
-
-手动编译等价命令：
+## 命令行
 
 ```powershell
-gcc -std=c17 -O2 -municode -mwindows `
-  -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE `
-  src\main.c src\image.c build\app_res.o -o build\Fustimage.exe `
-  -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lshcore `
-  -lole32 -loleaut32 -luuid -lshell32 -lcomdlg32 -lgdi32 -luser32 -lpropsys
+# 打开图片
+.\build\Fustimage.exe "D:\photos\a.jpg"
+
+# 批量导出（无窗口，可脚本化）
+.\build\Fustimage.exe --export out.jpg in.jpg --rot=1 --gray --crop=0.1,0.1,0.9,0.9
+
+# 离屏渲染 UI 截图（不建窗口、不抢焦点，用于文档与回归对比）
+.\build\Fustimage.exe --shot ui.png in.jpg --dark --crop=1
 ```
 
-图标和 manifest 由 `src/app.rc` 编入：
+`--export` / `--shot` 共用同一套参数：`--rot=N`、`--mirror-h`、`--mirror-v`、`--gray`、`--invert`、`--crop=l,t,r,b` 或 `--crop=N`（预置索引）；`--shot` 另支持 `--dark`、`--size=WxH`、`--zoom100`、`--cropping`。
 
-```powershell
-windres -I src -i src/app.rc -o build/app_res.o
+## 工程结构
+
 ```
-
-## 运行
-
-```powershell
-.\build\Fustimage.exe
-.\build\Fustimage.exe D:\path\to\photo.jpg
-.\build\Fustimage.exe D:\path\to\photo.jpg --dark
+src/
+  app.h      共享状态与契约（语义色、排版、图标与动作枚举、文档状态）
+  theme.c    MD3 亮/暗色角色表 + DirectWrite 排版（9 级）
+  icons.c    矢量图标（24×24、2 dp 描边、一次性建几何）
+  ui.c       布局、绘制、命中与指针（顶栏 / 侧栏 / 画布 / 裁剪叠加 / 提示条）
+  image.c    WIC 解码（含 EXIF 方向、缩放解码）、滤镜、编码导出
+  main.c     窗口、消息、工作线程、撤销、文件对话框、命令行
+docs/        设计规范与启动测量
+bench/       测量与调试工具（启动计时、探针、点击注入、旧版对照）
+legacy/      上一版源码（src-v1）与可执行文件
 ```
-
-`--light` 可强制浅色；默认浅色。
-
-## 代码结构
-
-| 文件 | 内容 |
-| --- | --- |
-| `src/main.c` | 布局、绘制、控件、主题、画布与裁剪覆盖层；末尾 include 两个实现片段 |
-| `src/ui_actions.inc` | 编辑动作、历史、裁剪数学、异步载入、打开/保存对话框、导出 |
-| `src/ui_window.inc` | WndProc、鼠标/键盘、DPI、窗口创建和消息循环 |
-| `src/image.h` / `src/image.c` | WIC 解码、EXIF 方向、旋转/镜像/裁剪后的像素映射与编码 |
-| `src/app.rc` / `src/app.manifest` | 图标与 Per-Monitor V2 DPI 声明 |
-| `assets/fustimage-icon.png` | 应用图标源图 |
-
-## 设计说明
-
-- 左侧工具栏是唯一的功能入口，全部控件由 Direct2D 自绘，没有原生按钮或图标字体。
-- 图形优先：旋转用数字 + 方向图标，镜像、撤销、重做、导出、复制、主题、裁剪应用/取消都用矢量图标；文字只保留在文件名、格式/尺寸元数据、快捷键提示和错误信息等必须精确表达的地方。
-- 比例预设默认无底板，只在悬停时出现状态层、选中时显示主色容器和描边；每次选择比例都从当前整张图片重新计算**该比例的最大居中选区**，不会在上一次裁剪范围上继续缩小，快速连续切换也没有间隔限制。
-- 语义化 Material You 色板：`primary`、`primary_container`、`surface`、`surface_container_low`、`outline_variant` 等；状态不只靠颜色，还配合选中边框、图标和禁用透明度。
-- 裁剪矩形统一保存为“最终显示空间”的归一化坐标 `{left, top, right, bottom}`；旋转/镜像时同步变换裁剪矩形，导出时再做逆变换回原图像素。
-- 导出通过临时文件写入，成功后原子替换目标文件，避免半截文件。
 
 ## 已知限制
 
-- 自绘控件没有暴露 MSAA/UIA 语义；键盘焦点、Tab 顺序、可见焦点环和 tooltip 可用，但屏幕阅读器无法逐控件朗读。
-- 一次只编辑一张图片，没有图层/多文档。
-- 裁剪后的画布元数据仍显示源图尺寸；导出文件尺寸以实际裁剪结果为准。
-- 主题选择不持久化，下次启动回到浅色（可用 `--dark` 启动）。
+- 只吃本机文件，不做云同步；HEIC/AVIF 取决于系统的 WIC 解码器。
+- 大于约 8000 px 的图按 8192 上限解码，超出部分不保留。
+- 硬件渲染（D3D）没有启用：本机混合显卡下 `CreateHwndRenderTarget` 要走 250–340 ms 的一次性驱动初始化，代价远大于收益。
